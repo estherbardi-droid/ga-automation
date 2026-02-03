@@ -1,5 +1,5 @@
 // health.runners.js
-// GOLD VERSION: frame-aware form detection + test-per-page crawling + modal probing + better counters
+// GOLD VERSION (UPDATED): stabilise waits + provider-aware form detection + looser form-like matching + broader modal probing
 // - Detects GTM/GA4 via DOM + network evidence
 // - Accepts cookie banners (incl iframes)
 // - Finds CTAs (tel/mailto) + finds forms in main DOM + iframes + “form-like” containers
@@ -7,6 +7,15 @@
 // - Probes likely contact buttons to open modals, then rescans forms
 // - Captures GA4 events from GET + POST /g/collect and records relevant events
 // - Safer form fill (no real PII), best-effort submit click, and records why submit didn’t happen
+//
+// NEW FIXES:
+// 1) stabilise(page): waits for networkidle + extra settle time after goto/probe (late-loaded forms)
+// 2) findVisibleFormsEverywhere():
+//    - detects common WP builders (Elementor / CF7 / WPForms / Gravity / Fluent / Ninja)
+//    - less strict form-like detection (no exact button text requirement)
+//    - embedded iframe fallback (Typeform/Jotform/HubSpot/Wufoo/Formstack/Google Forms etc.) so you don’t report 0
+// 3) probeForContactModal(): broader selectors (aria-label, data-open, #contact anchors, “Request”, etc.)
+// 4) testForms(): submit selector broadened (Continue/Next/Get Started/Request Callback etc.) + aria-label submit
 
 const { chromium } = require('playwright');
 
@@ -53,6 +62,13 @@ async function scrollToFooter(page) {
   } catch {}
 }
 
+async function stabilise(page) {
+  // Give SPA/widget forms time to render, and let async scripts settle.
+  await page.waitForLoadState('domcontentloaded').catch(() => {});
+  await page.waitForLoadState('networkidle', { timeout: 8000 }).catch(() => {});
+  await page.waitForTimeout(1500);
+}
+
 async function robustClick(locator, page, labelForLogs = '') {
   // Goal: trigger site click handlers (GTM listeners), not OS handlers.
   // Return: { ok: boolean, reason?: string }
@@ -66,10 +82,12 @@ async function robustClick(locator, page, labelForLogs = '') {
     await locator.click({ trial: true, timeout: 2000 }).catch(() => {});
 
     await locator.click({ timeout: 3000 }).catch(async () => {
-      await locator.evaluate(el => {
-        const ev = new MouseEvent('click', { bubbles: true, cancelable: true, view: window });
-        el.dispatchEvent(ev);
-      }).catch(() => {});
+      await locator
+        .evaluate(el => {
+          const ev = new MouseEvent('click', { bubbles: true, cancelable: true, view: window });
+          el.dispatchEvent(ev);
+        })
+        .catch(() => {});
     });
 
     await page.waitForTimeout(600);
@@ -90,10 +108,16 @@ async function clickConsentEverywhere(page) {
     'button:has-text("Agree")',
     'button:has-text("OK")',
     'button:has-text("Continue")',
+    'button:has-text("Allow")',
+    'button:has-text("Yes")',
     '.cookie-accept',
+    '.accept-cookies',
     '[aria-label*="accept" i]',
+    '[aria-label*="agree" i]',
     '[id*="accept" i]',
-    '[class*="accept" i]'
+    '[class*="accept" i]',
+    '[data-testid*="accept" i]',
+    '[data-qa*="accept" i]'
   ];
 
   let clicked = false;
@@ -209,7 +233,7 @@ const FORM_EVENT_PATTERNS = [
   'enquiry',
   'quote',
   'submit',
-  'form_start', // include start so you can see partial coverage
+  'form_start',
   'begin_checkout'
 ];
 
@@ -297,7 +321,8 @@ async function trackingHealthCheckSite(inputUrl) {
     debug: {
       pages_tested: [],
       consent_clicked: false,
-      modal_probe_clicked: 0
+      modal_probe_clicked: 0,
+      embedded_forms: [] // NEW: iframe/provider fallbacks
     }
   };
 
@@ -317,15 +342,15 @@ async function trackingHealthCheckSite(inputUrl) {
     for (const u of attempts) {
       try {
         const resp = await page.goto(u, { waitUntil: 'domcontentloaded', timeout: 45000 });
-        await page.waitForTimeout(800);
         results.final_url = page.url();
+        await stabilise(page);
         return resp;
       } catch (e) {
         lastErr = e;
         try {
           const resp2 = await page.goto(u, { waitUntil: 'commit', timeout: 30000 });
-          await page.waitForTimeout(800);
           results.final_url = page.url();
+          await stabilise(page);
           return resp2;
         } catch (e2) {
           lastErr = e2;
@@ -451,60 +476,111 @@ async function trackingHealthCheckSite(inputUrl) {
     return { filledFields: filled, notes };
   }
 
-  // NEW: frame-aware form + form-like container discovery
-  async function findVisibleFormsEverywhere(page, { maxVisible = 5 } = {}) {
+  // UPDATED: provider-aware + less strict + embedded iframe fallback
+  async function findVisibleFormsEverywhere(page, { maxVisible = 10 } = {}) {
     const found = [];
+    const embeddedIframes = [];
 
-    async function collectFromFrame(frame) {
-      // 1) Real <form>
-      const forms = frame.locator('form');
-      const n = await forms.count().catch(() => 0);
+    const PROVIDER_IFRAME_SEL =
+      'iframe[src*="form" i], iframe[title*="form" i], iframe[src*="jotform" i], iframe[src*="typeform" i], iframe[src*="hubspot" i], iframe[src*="hsforms" i], iframe[src*="wufoo" i], iframe[src*="formstack" i], iframe[src*="123formbuilder" i], iframe[src*="google.com/forms" i], iframe[src*="forms.gle" i]';
 
-      for (let i = 0; i < n && found.length < maxVisible; i++) {
-        const f = forms.nth(i);
-        const vis = await f.isVisible().catch(() => false);
-        if (!vis) continue;
-
-        const fieldCount = await f.locator('input, textarea, select').count().catch(() => 0);
-        if (fieldCount === 0) continue;
-
-        found.push({ kind: 'form', frameUrl: frame.url(), locator: f });
-      }
-
+    async function pushIfTestable(frame, loc, kind) {
       if (found.length >= maxVisible) return;
 
-      // 2) Form-like containers (div-based)
-      const formLike = frame
-        .locator('[role="form"], [class*="form" i], [id*="form" i], section:has(input), div:has(input)')
-        .filter({ has: frame.locator('input, textarea, select') })
-        .filter({
-          has: frame.locator(
-            'button:has-text("Submit"), button:has-text("Send"), button:has-text("Enquire"), button:has-text("Enquiry"), button:has-text("Get Quote"), button:has-text("Book"), input[type="submit"], button[type="submit"]'
-          )
-        });
+      const visible = await loc.isVisible().catch(() => false);
+      if (!visible) return;
 
-      const m = await formLike.count().catch(() => 0);
-      for (let i = 0; i < m && found.length < maxVisible; i++) {
-        const c = formLike.nth(i);
-        const vis = await c.isVisible().catch(() => false);
-        if (!vis) continue;
+      const visibleFields = await loc.locator('input:visible, textarea:visible, select:visible').count().catch(() => 0);
+      if (visibleFields === 0) return;
 
-        found.push({ kind: 'form_like', frameUrl: frame.url(), locator: c });
-      }
+      found.push({ kind, frameUrl: frame.url(), locator: loc });
     }
 
     for (const frame of page.frames()) {
       if (found.length >= maxVisible) break;
-      await collectFromFrame(frame);
+
+      // 1) Builder/library-specific (high hit rate)
+      const roots = [
+        { kind: 'form', sel: 'form:has(input,textarea,select)' },
+        { kind: 'cf7', sel: '.wpcf7 form:has(input,textarea,select)' },
+        { kind: 'elementor', sel: 'form.elementor-form:has(input,textarea,select)' },
+        { kind: 'wpforms', sel: 'form.wpforms-form:has(input,textarea,select)' },
+        { kind: 'gravity', sel: '.gform_wrapper form:has(input,textarea,select)' },
+        { kind: 'fluent', sel: 'form.fluent_form:has(input,textarea,select)' },
+        { kind: 'ninja', sel: '.nf-form-cont:has(input,textarea,select)' },
+        { kind: 'role_form', sel: '[role="form"]:has(input,textarea,select)' }
+      ];
+
+      for (const r of roots) {
+        if (found.length >= maxVisible) break;
+        const loc = frame.locator(r.sel).first();
+        const has = await loc.count().catch(() => 0);
+        if (!has) continue;
+        await pushIfTestable(frame, loc, r.kind);
+      }
+
+      if (found.length >= maxVisible) continue;
+
+      // 2) Form-like containers (looser: no exact button text requirement)
+      const formLike = frame
+        .locator('section, div, article, main, aside')
+        .filter({ has: frame.locator('input, textarea, select') })
+        .filter({ has: frame.locator('button, [role="button"], input[type="submit"], button[type="submit"]') });
+
+      const m = await formLike.count().catch(() => 0);
+      for (let i = 0; i < m && found.length < maxVisible; i++) {
+        const c = formLike.nth(i);
+        await pushIfTestable(frame, c, 'form_like');
+      }
     }
 
-    return found;
+    // 3) Embedded iframe fallback (so “found 0” stops happening)
+    try {
+      const iframeLocs = page.locator(PROVIDER_IFRAME_SEL);
+      const n = await iframeLocs.count().catch(() => 0);
+      for (let i = 0; i < Math.min(n, 10); i++) {
+        const fr = iframeLocs.nth(i);
+        const vis = await fr.isVisible().catch(() => false);
+        if (!vis) continue;
+        const src = await fr.getAttribute('src').catch(() => null);
+        const title = await fr.getAttribute('title').catch(() => null);
+        embeddedIframes.push({ src, title });
+      }
+    } catch {}
+
+    return { found, embeddedIframes };
   }
 
-  // NEW: click likely “open form” CTAs to reveal modal forms
+  // UPDATED: broader modal probing
   async function probeForContactModal(page, maxClicks = 3) {
     const candidates = page.locator(
-      'a:has-text("Contact"), a:has-text("Get in touch"), a:has-text("Enquire"), a:has-text("Enquiry"), a:has-text("Get quote"), a:has-text("Quote"), button:has-text("Contact"), button:has-text("Enquire"), button:has-text("Get Quote"), button:has-text("Book")'
+      [
+        'a:has-text("Contact")',
+        'a:has-text("Get in touch")',
+        'a:has-text("Enquire")',
+        'a:has-text("Enquiry")',
+        'a:has-text("Quote")',
+        'a:has-text("Get quote")',
+        'a:has-text("Request")',
+        'a:has-text("Callback")',
+        'a:has-text("Message")',
+        'a:has-text("Book")',
+        'a[href*="#contact" i]',
+        'button:has-text("Contact")',
+        'button:has-text("Enquire")',
+        'button:has-text("Quote")',
+        'button:has-text("Request")',
+        'button:has-text("Callback")',
+        'button:has-text("Message")',
+        'button:has-text("Book")',
+        '[aria-label*="contact" i]',
+        '[aria-label*="enquir" i]',
+        '[aria-label*="quote" i]',
+        '[aria-label*="book" i]',
+        '[aria-controls*="modal" i]',
+        '[data-open*="modal" i]',
+        '[data-modal*="open" i]'
+      ].join(', ')
     );
 
     const count = await candidates.count().catch(() => 0);
@@ -516,9 +592,9 @@ async function trackingHealthCheckSite(inputUrl) {
       const res = await robustClick(loc, page, 'modal_probe');
       if (res.ok) {
         clicked++;
-        await page.waitForTimeout(1200);
-        await clickConsentEverywhere(page).catch(() => {});
         await page.waitForTimeout(600);
+        await clickConsentEverywhere(page).catch(() => {});
+        await stabilise(page);
       }
     }
     return clicked;
@@ -530,26 +606,31 @@ async function trackingHealthCheckSite(inputUrl) {
     const phoneLocators = page.locator('a[href^="tel:"]');
     const emailLocators = page.locator('a[href^="mailto:"]');
 
-    const phoneCount = await phoneLocators.count().catch(() => 0);
-    const emailCount = await emailLocators.count().catch(() => 0);
-
     // first scan
-    let visibleForms = await findVisibleFormsEverywhere(page, { maxVisible: 5 });
+    let { found: visibleForms, embeddedIframes } = await findVisibleFormsEverywhere(page, { maxVisible: 10 });
 
     // if none found, try opening modals then rescan
     if (visibleForms.length === 0) {
       const clicked = await probeForContactModal(page, 3).catch(() => 0);
       results.debug.modal_probe_clicked += clicked;
-      visibleForms = await findVisibleFormsEverywhere(page, { maxVisible: 5 });
+
+      ({ found: visibleForms, embeddedIframes } = await findVisibleFormsEverywhere(page, { maxVisible: 10 }));
+    }
+
+    // record embed evidence (debug)
+    if (embeddedIframes.length) {
+      results.debug.embedded_forms.push({
+        page: page.url(),
+        iframes: embeddedIframes
+      });
     }
 
     return {
       phoneLocators,
       emailLocators,
       visibleForms, // array of {kind, frameUrl, locator}
-      phoneCount,
-      emailCount,
-      visibleFormCount: visibleForms.length
+      visibleFormCount: visibleForms.length,
+      embeddedIframes
     };
   }
 
@@ -713,7 +794,24 @@ async function trackingHealthCheckSite(inputUrl) {
       try {
         const submit = container
           .locator(
-            'button[type="submit"], input[type="submit"], button:has-text("Submit"), button:has-text("Send"), button:has-text("Enquire"), button:has-text("Enquiry"), button:has-text("Get Quote"), button:has-text("Book")'
+            [
+              'button[type="submit"]',
+              'input[type="submit"]',
+              'button:has-text("Submit")',
+              'button:has-text("Send")',
+              'button:has-text("Enquire")',
+              'button:has-text("Enquiry")',
+              'button:has-text("Get Quote")',
+              'button:has-text("Request")',
+              'button:has-text("Request Callback")',
+              'button:has-text("Get Started")',
+              'button:has-text("Continue")',
+              'button:has-text("Next")',
+              'button:has-text("Book")',
+              '[aria-label*="submit" i]',
+              '[aria-label*="send" i]',
+              '[aria-label*="enquir" i]'
+            ].join(', ')
           )
           .first();
 
@@ -734,7 +832,7 @@ async function trackingHealthCheckSite(inputUrl) {
         submitReason = `submit_error: ${e.message}`;
       }
 
-      await page.waitForTimeout(1800);
+      await page.waitForTimeout(2000);
       const t1 = Date.now();
 
       const newBeacons = beaconsBetween(before, t0, t1);
@@ -775,7 +873,7 @@ async function trackingHealthCheckSite(inputUrl) {
     results.debug.pages_tested.push({ tag, url: page.url() });
 
     await clickConsentEverywhere(page).catch(() => {});
-    await page.waitForTimeout(1200);
+    await stabilise(page);
     await scrollToFooter(page);
 
     const ctas = await findCtas();
@@ -798,7 +896,7 @@ async function trackingHealthCheckSite(inputUrl) {
         if (!isSameOrigin(baseUrl, next)) continue;
 
         await page.goto(next, { waitUntil: 'domcontentloaded', timeout: 20000 });
-        await page.waitForTimeout(1000);
+        await stabilise(page);
 
         await testThisPage(`crawl:${path}`);
         visited.add(next);
@@ -817,12 +915,11 @@ async function trackingHealthCheckSite(inputUrl) {
     const consent = await clickConsentEverywhere(page).catch(() => false);
     results.debug.consent_clicked = !!consent;
 
-    await page.waitForTimeout(2000);
+    await stabilise(page);
     await scrollToFooter(page);
 
     const tagData = await detectTagsInDom().catch(() => ({ gtm: [], ga4: [], hasGtmObj: false, hasGtagFn: false }));
 
-    await page.waitForTimeout(1500);
     await collectTrackingEvidence();
 
     results.tracking.gtm_ids = uniq(tagData.gtm);
@@ -863,6 +960,12 @@ async function trackingHealthCheckSite(inputUrl) {
       results.issues.push('⚠️ GA4 found but no GA4 collect beacons were seen');
     }
 
+    // If we saw embedded iframe forms but found none testable, record it as a warning not “0 forms”
+    const embeddedCount = results.debug.embedded_forms.reduce((acc, x) => acc + (x.iframes?.length || 0), 0);
+    if (results.ctas.forms.total_found === 0 && embeddedCount > 0) {
+      results.issues.push(`⚠️ Form embed detected in iframe (${embeddedCount}) but no testable fields were accessible`);
+    }
+
     if (totalTested > 0) {
       results.summary = `${totalWorking}/${totalTested} CTA tests fired relevant GA4 events`;
     } else {
@@ -871,10 +974,6 @@ async function trackingHealthCheckSite(inputUrl) {
 
     const criticalCount = results.issues.filter(x => x.includes('CRITICAL')).length;
 
-    // CLASSIFICATION:
-    // - FAILING: no tracking evidence OR critical
-    // - WARNING: tracking present but ANY CTA broken (including “form_start only” if you treat as broken)
-    // - HEALTHY: tracking present and no CTA broken
     if (criticalCount > 0 || !trackingOk) {
       results.overall_status = 'FAILING';
     } else if (totalBroken > 0) {
