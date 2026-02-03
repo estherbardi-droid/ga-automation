@@ -2,19 +2,21 @@
 // GOLD VERSION (UPDATED): stabilise waits + provider-aware form detection + looser form-like matching + broader modal probing
 // - Detects GTM/GA4 via DOM + network evidence
 // - Accepts cookie banners (incl iframes)
-// - Finds CTAs (tel/mailto) + finds forms in main DOM + iframes + “form-like” containers
+// - Finds CTAs (tel/mailto) + finds forms in main DOM + iframes + "form-like" containers
 // - Tests CTAs on homepage + each contact-like page (not just last visited)
 // - Probes likely contact buttons to open modals, then rescans forms
 // - Captures GA4 events from GET + POST /g/collect and records relevant events
-// - Safer form fill (no real PII), best-effort submit click, and records why submit didn’t happen
+// - Safer form fill (no real PII), best-effort submit click, and records why submit didn't happen
 //
-// NEW FIXES:
+// FIXES:
 // 1) stabilise(page): waits for networkidle + extra settle time after goto/probe (late-loaded forms)
 // 2) findVisibleFormsEverywhere():
 //    - detects common WP builders (Elementor / CF7 / WPForms / Gravity / Fluent / Ninja)
 //    - less strict form-like detection (no exact button text requirement)
-//    - embedded iframe fallback (Typeform/Jotform/HubSpot/Wufoo/Formstack/Google Forms etc.) so you don’t report 0
-// 3) probeForContactModal(): broader selectors (aria-label, data-open, #contact anchors, “Request”, etc.)
+//    - embedded iframe fallback (Typeform/Jotform/HubSpot/Wufoo/Formstack/Google Forms etc.)
+//    - finds ALL forms, not just first match
+//    - doesn't skip forms just because they're hidden
+// 3) probeForContactModal(): broader selectors (aria-label, data-open, #contact anchors, "Request", etc.)
 // 4) testForms(): submit selector broadened (Continue/Next/Get Started/Request Callback etc.) + aria-label submit
 
 const { chromium } = require('playwright');
@@ -66,7 +68,7 @@ async function stabilise(page) {
   // Give SPA/widget forms time to render, and let async scripts settle.
   await page.waitForLoadState('domcontentloaded').catch(() => {});
   await page.waitForLoadState('networkidle', { timeout: 8000 }).catch(() => {});
-  await page.waitForTimeout(1500);
+  await page.waitForTimeout(2000); // Increased from 1500ms
 }
 
 async function robustClick(locator, page, labelForLogs = '') {
@@ -322,7 +324,7 @@ async function trackingHealthCheckSite(inputUrl) {
       pages_tested: [],
       consent_clicked: false,
       modal_probe_clicked: 0,
-      embedded_forms: [] // NEW: iframe/provider fallbacks
+      embedded_forms: []
     }
   };
 
@@ -476,79 +478,155 @@ async function trackingHealthCheckSite(inputUrl) {
     return { filledFields: filled, notes };
   }
 
-  // UPDATED: provider-aware + less strict + embedded iframe fallback
+  // UPDATED: provider-aware + less strict + embedded iframe fallback + better logging
   async function findVisibleFormsEverywhere(page, { maxVisible = 10 } = {}) {
     const found = [];
     const embeddedIframes = [];
+    const debug = {
+      form_tags_found: 0,
+      form_tags_visible: 0,
+      form_like_containers: 0,
+      builder_forms: 0,
+      iframe_forms: 0,
+      skipped_no_fields: 0,
+      skipped_invisible: 0
+    };
 
-    const PROVIDER_IFRAME_SEL =
-      'iframe[src*="form" i], iframe[title*="form" i], iframe[src*="jotform" i], iframe[src*="typeform" i], iframe[src*="hubspot" i], iframe[src*="hsforms" i], iframe[src*="wufoo" i], iframe[src*="formstack" i], iframe[src*="123formbuilder" i], iframe[src*="google.com/forms" i], iframe[src*="forms.gle" i]';
+    console.log(`🔍 Scanning ${page.url()} for forms...`);
+
+    const PROVIDER_IFRAME_SEL = `
+      iframe[src*="typeform" i],
+      iframe[src*="jotform" i],
+      iframe[src*="hubspot" i],
+      iframe[src*="hsforms" i],
+      iframe[src*="wufoo" i],
+      iframe[src*="formstack" i],
+      iframe[src*="google.com/forms" i],
+      iframe[src*="forms.gle" i],
+      iframe[src*="cognito" i],
+      iframe[src*="123formbuilder" i],
+      iframe[title*="form" i],
+      iframe[name*="form" i]
+    `.trim();
 
     async function pushIfTestable(frame, loc, kind) {
       if (found.length >= maxVisible) return;
 
+      const exists = await loc.count().catch(() => 0);
+      if (!exists) return;
+
       const visible = await loc.isVisible().catch(() => false);
-      if (!visible) return;
 
-      const visibleFields = await loc.locator('input:visible, textarea:visible, select:visible').count().catch(() => 0);
-      if (visibleFields === 0) return;
+      // Check for fields (visible or hidden - we'll handle visibility later)
+      const allFields = await loc.locator('input:not([type="hidden"]), textarea, select').count().catch(() => 0);
+      if (allFields === 0) {
+        debug.skipped_no_fields++;
+        return;
+      }
 
-      found.push({ kind, frameUrl: frame.url(), locator: loc });
+      const visibleFields = await loc
+        .locator('input:visible:not([type="hidden"]), textarea:visible, select:visible')
+        .count()
+        .catch(() => 0);
+
+      if (!visible) {
+        debug.skipped_invisible++;
+      }
+
+      found.push({
+        kind,
+        frameUrl: frame.url(),
+        locator: loc,
+        visible,
+        totalFields: allFields,
+        visibleFields
+      });
     }
 
     for (const frame of page.frames()) {
       if (found.length >= maxVisible) break;
 
-      // 1) Builder/library-specific (high hit rate)
-      const roots = [
-        { kind: 'form', sel: 'form:has(input,textarea,select)' },
-        { kind: 'cf7', sel: '.wpcf7 form:has(input,textarea,select)' },
-        { kind: 'elementor', sel: 'form.elementor-form:has(input,textarea,select)' },
-        { kind: 'wpforms', sel: 'form.wpforms-form:has(input,textarea,select)' },
-        { kind: 'gravity', sel: '.gform_wrapper form:has(input,textarea,select)' },
-        { kind: 'fluent', sel: 'form.fluent_form:has(input,textarea,select)' },
-        { kind: 'ninja', sel: '.nf-form-cont:has(input,textarea,select)' },
-        { kind: 'role_form', sel: '[role="form"]:has(input,textarea,select)' }
-      ];
+      // PASS 1: Standard <form> tags (most reliable) - find ALL, not just first
+      const formTags = await frame.locator('form').all().catch(() => []);
+      debug.form_tags_found += formTags.length;
 
-      for (const r of roots) {
+      for (const formLoc of formTags) {
         if (found.length >= maxVisible) break;
-        const loc = frame.locator(r.sel).first();
-        const has = await loc.count().catch(() => 0);
-        if (!has) continue;
-        await pushIfTestable(frame, loc, r.kind);
+        const vis = await formLoc.isVisible().catch(() => false);
+        if (vis) debug.form_tags_visible++;
+        await pushIfTestable(frame, formLoc, 'form');
       }
 
-      if (found.length >= maxVisible) continue;
+      // PASS 2: WordPress form builders (high hit rate) - find ALL
+      const builders = [
+        { kind: 'cf7', sel: '.wpcf7-form, .wpcf7' },
+        { kind: 'elementor', sel: '.elementor-form, form.elementor-form' },
+        { kind: 'wpforms', sel: '.wpforms-form, form.wpforms-form' },
+        { kind: 'gravity', sel: '.gform_wrapper, .gform_wrapper form' },
+        { kind: 'fluent', sel: '.fluentform, form.frm-fluent-form' },
+        { kind: 'ninja', sel: '.nf-form-cont, .nf-form-wrap' },
+        { kind: 'formidable', sel: '.frm_forms, .frm_form_fields' },
+        { kind: 'forminator', sel: '.forminator-custom-form' }
+      ];
 
-      // 2) Form-like containers (looser: no exact button text requirement)
-      const formLike = frame
-        .locator('section, div, article, main, aside')
-        .filter({ has: frame.locator('input, textarea, select') })
-        .filter({ has: frame.locator('button, [role="button"], input[type="submit"], button[type="submit"]') });
+      for (const b of builders) {
+        if (found.length >= maxVisible) break;
+        const locs = await frame.locator(b.sel).all().catch(() => []);
+        for (const loc of locs) {
+          if (found.length >= maxVisible) break;
+          await pushIfTestable(frame, loc, b.kind);
+          debug.builder_forms++;
+        }
+      }
 
-      const m = await formLike.count().catch(() => 0);
-      for (let i = 0; i < m && found.length < maxVisible; i++) {
-        const c = formLike.nth(i);
-        await pushIfTestable(frame, c, 'form_like');
+      // PASS 3: [role="form"] - find ALL
+      const roleForms = await frame.locator('[role="form"]').all().catch(() => []);
+      for (const loc of roleForms) {
+        if (found.length >= maxVisible) break;
+        await pushIfTestable(frame, loc, 'role_form');
+      }
+
+      // PASS 4: Containers with fields + button (form-like) - simplified
+      const formLike = await frame
+        .locator('section, div, article, main')
+        .filter({ has: frame.locator('input:not([type="hidden"]), textarea, select') })
+        .all()
+        .catch(() => []);
+
+      for (const loc of formLike.slice(0, 5)) {
+        // Limit to avoid noise
+        if (found.length >= maxVisible) break;
+
+        // Check if it has a button-like element
+        const hasButton = await loc
+          .locator('button, [type="submit"], [role="button"], a[class*="button" i], a[class*="btn" i]')
+          .count()
+          .catch(() => 0);
+
+        if (hasButton > 0) {
+          await pushIfTestable(frame, loc, 'form_like');
+          debug.form_like_containers++;
+        }
       }
     }
 
-    // 3) Embedded iframe fallback (so “found 0” stops happening)
+    // PASS 5: Embedded iframe forms (fallback evidence)
     try {
-      const iframeLocs = page.locator(PROVIDER_IFRAME_SEL);
-      const n = await iframeLocs.count().catch(() => 0);
-      for (let i = 0; i < Math.min(n, 10); i++) {
-        const fr = iframeLocs.nth(i);
+      const iframeLocs = await page.locator(PROVIDER_IFRAME_SEL).all().catch(() => []);
+      for (const fr of iframeLocs.slice(0, 10)) {
         const vis = await fr.isVisible().catch(() => false);
         if (!vis) continue;
         const src = await fr.getAttribute('src').catch(() => null);
         const title = await fr.getAttribute('title').catch(() => null);
         embeddedIframes.push({ src, title });
+        debug.iframe_forms++;
       }
     } catch {}
 
-    return { found, embeddedIframes };
+    console.log('Form detection summary:', debug);
+    console.log(`✅ Found ${found.length} testable forms, ${embeddedIframes.length} iframe forms`);
+
+    return { found, embeddedIframes, debug };
   }
 
   // UPDATED: broader modal probing
@@ -607,14 +685,15 @@ async function trackingHealthCheckSite(inputUrl) {
     const emailLocators = page.locator('a[href^="mailto:"]');
 
     // first scan
-    let { found: visibleForms, embeddedIframes } = await findVisibleFormsEverywhere(page, { maxVisible: 10 });
+    let { found: visibleForms, embeddedIframes, debug } = await findVisibleFormsEverywhere(page, { maxVisible: 10 });
 
     // if none found, try opening modals then rescan
     if (visibleForms.length === 0) {
+      console.log('⚠️  No forms found, trying modal probe...');
       const clicked = await probeForContactModal(page, 3).catch(() => 0);
       results.debug.modal_probe_clicked += clicked;
 
-      ({ found: visibleForms, embeddedIframes } = await findVisibleFormsEverywhere(page, { maxVisible: 10 }));
+      ({ found: visibleForms, embeddedIframes, debug } = await findVisibleFormsEverywhere(page, { maxVisible: 10 }));
     }
 
     // record embed evidence (debug)
@@ -628,7 +707,7 @@ async function trackingHealthCheckSite(inputUrl) {
     return {
       phoneLocators,
       emailLocators,
-      visibleForms, // array of {kind, frameUrl, locator}
+      visibleForms, // array of {kind, frameUrl, locator, visible, totalFields, visibleFields}
       visibleFormCount: visibleForms.length,
       embeddedIframes
     };
@@ -768,6 +847,34 @@ async function trackingHealthCheckSite(inputUrl) {
       const item = visibleForms[i];
       const container = item.locator;
 
+      console.log(
+        `Testing form ${i + 1}/${limit}: ${item.kind} (visible: ${item.visible}, fields: ${item.visibleFields}/${item.totalFields})`
+      );
+
+      // If form is not visible, try to make it visible
+      if (!item.visible) {
+        console.log('  Form not visible, attempting to reveal...');
+        await container.scrollIntoViewIfNeeded().catch(() => {});
+        await page.waitForTimeout(500);
+
+        const nowVisible = await container.isVisible().catch(() => false);
+        if (!nowVisible) {
+          console.log('  Form still not visible after scroll, skipping');
+          results.ctas.forms.broken++;
+          results.ctas.forms.broken_details.push({
+            form_index: i + 1,
+            kind: item.kind,
+            frame_url: item.frameUrl,
+            reason: 'Form not visible/accessible',
+            events_fired: [],
+            filled_fields: 0,
+            submit_clicked: false,
+            notes: []
+          });
+          continue;
+        }
+      }
+
       const before = allBeacons.length;
       const t0 = Date.now();
 
@@ -784,52 +891,58 @@ async function trackingHealthCheckSite(inputUrl) {
         const c = await firstInput.count().catch(() => 0);
         if (c) {
           await firstInput.focus().catch(() => {});
-          await page.waitForTimeout(200);
+          await firstInput.click().catch(() => {}); // Some trackers need click
+          await page.waitForTimeout(400);
         }
       } catch {}
 
       let submitClicked = false;
       let submitReason = null;
 
-      try {
-        const submit = container
-          .locator(
-            [
-              'button[type="submit"]',
-              'input[type="submit"]',
-              'button:has-text("Submit")',
-              'button:has-text("Send")',
-              'button:has-text("Enquire")',
-              'button:has-text("Enquiry")',
-              'button:has-text("Get Quote")',
-              'button:has-text("Request")',
-              'button:has-text("Request Callback")',
-              'button:has-text("Get Started")',
-              'button:has-text("Continue")',
-              'button:has-text("Next")',
-              'button:has-text("Book")',
-              '[aria-label*="submit" i]',
-              '[aria-label*="send" i]',
-              '[aria-label*="enquir" i]'
-            ].join(', ')
-          )
-          .first();
+      // UPDATED: Try multiple submit selectors
+      const submitSelectors = [
+        'button[type="submit"]:visible',
+        'input[type="submit"]:visible',
+        'button:has-text("Submit"):visible',
+        'button:has-text("Send"):visible',
+        'button:has-text("Enquire"):visible',
+        'button:has-text("Enquiry"):visible',
+        'button:has-text("Get Quote"):visible',
+        'button:has-text("Request"):visible',
+        'button:has-text("Request Callback"):visible',
+        'button:has-text("Get Started"):visible',
+        'button:has-text("Continue"):visible',
+        'button:has-text("Next"):visible',
+        'button:has-text("Book"):visible',
+        '[aria-label*="submit" i]:visible',
+        '[aria-label*="send" i]:visible',
+        '[aria-label*="enquir" i]:visible'
+      ];
 
-        const has = await submit.count().catch(() => 0);
-        if (has) {
-          const vis = await submit.isVisible().catch(() => false);
-          if (vis) {
+      for (const sel of submitSelectors) {
+        if (submitClicked) break;
+
+        try {
+          const submit = container.locator(sel).first();
+          const has = await submit.count().catch(() => 0);
+
+          if (has) {
             const res = await robustClick(submit, page, 'form_submit');
-            submitClicked = res.ok;
-            if (!res.ok) submitReason = res.reason || 'submit_click_failed';
-          } else {
-            submitReason = 'submit_not_visible';
+            if (res.ok) {
+              submitClicked = true;
+              console.log(`  Submit clicked via: ${sel}`);
+              break;
+            } else {
+              submitReason = res.reason;
+            }
           }
-        } else {
-          submitReason = 'no_submit_button_found';
+        } catch (e) {
+          submitReason = `${sel}: ${e.message}`;
         }
-      } catch (e) {
-        submitReason = `submit_error: ${e.message}`;
+      }
+
+      if (!submitClicked) {
+        console.log(`  Submit not clicked: ${submitReason || 'no button found'}`);
       }
 
       await page.waitForTimeout(2000);
@@ -838,6 +951,8 @@ async function trackingHealthCheckSite(inputUrl) {
       const newBeacons = beaconsBetween(before, t0, t1);
       const ga4Events = uniq(newBeacons.filter(b => b.type === 'GA4').map(b => b.event_name).filter(Boolean));
       const relevant = ga4Events.filter(ev => isRelevantEventName(ev, FORM_EVENT_PATTERNS, IGNORE_EXACT_EVENTS));
+
+      console.log(`  Events: ${ga4Events.join(', ') || 'none'} (relevant: ${relevant.join(', ') || 'none'})`);
 
       if (relevant.length > 0) {
         results.ctas.forms.working++;
@@ -858,8 +973,8 @@ async function trackingHealthCheckSite(inputUrl) {
           kind: item.kind,
           frame_url: item.frameUrl,
           reason: ga4Events.length
-            ? `No form event. Events: ${ga4Events.join(', ')}`
-            : `No GA4 event fired${submitReason ? ` (${submitReason})` : ''}`,
+            ? `No form event fired. Saw: ${ga4Events.join(', ')}`
+            : `No GA4 events captured${submitReason ? ` (${submitReason})` : ''}`,
           events_fired: ga4Events,
           filled_fields: filledFields,
           submit_clicked: submitClicked,
@@ -910,6 +1025,10 @@ async function trackingHealthCheckSite(inputUrl) {
     const target = normaliseUrl(inputUrl);
     results.url = target;
 
+    console.log(`\n${'='.repeat(60)}`);
+    console.log(`Starting health check for: ${target}`);
+    console.log('='.repeat(60));
+
     await gotoWithHttpsFallback(target);
 
     const consent = await clickConsentEverywhere(page).catch(() => false);
@@ -925,6 +1044,9 @@ async function trackingHealthCheckSite(inputUrl) {
     results.tracking.gtm_ids = uniq(tagData.gtm);
     results.tracking.ga4_ids = uniq(tagData.ga4);
 
+    console.log(`GTM IDs: ${results.tracking.gtm_ids.join(', ') || 'none'}`);
+    console.log(`GA4 IDs: ${results.tracking.ga4_ids.join(', ') || 'none'}`);
+
     const sawGtm = results.tracking.evidence.saw_gtm_js;
     const sawGa4 = results.tracking.evidence.saw_ga4_collect;
 
@@ -939,9 +1061,11 @@ async function trackingHealthCheckSite(inputUrl) {
     }
 
     // HOME PAGE TEST
+    console.log('\n--- Testing Home Page ---');
     await testThisPage('home');
 
     // CONTACT-LIKE PAGES TEST (per page)
+    console.log('\n--- Crawling Contact Pages ---');
     const baseUrl = results.final_url || page.url();
     const origin = new URL(baseUrl).origin;
     await crawlAndTestContactPages(origin);
@@ -960,7 +1084,7 @@ async function trackingHealthCheckSite(inputUrl) {
       results.issues.push('⚠️ GA4 found but no GA4 collect beacons were seen');
     }
 
-    // If we saw embedded iframe forms but found none testable, record it as a warning not “0 forms”
+    // If we saw embedded iframe forms but found none testable, record it as a warning not "0 forms"
     const embeddedCount = results.debug.embedded_forms.reduce((acc, x) => acc + (x.iframes?.length || 0), 0);
     if (results.ctas.forms.total_found === 0 && embeddedCount > 0) {
       results.issues.push(`⚠️ Form embed detected in iframe (${embeddedCount}) but no testable fields were accessible`);
@@ -983,9 +1107,15 @@ async function trackingHealthCheckSite(inputUrl) {
     }
 
     await collectTrackingEvidence();
+
+    console.log(`\n${'='.repeat(60)}`);
+    console.log(`Final Status: ${results.overall_status}`);
+    console.log(`Summary: ${results.summary}`);
+    console.log('='.repeat(60));
   } catch (e) {
     results.overall_status = 'ERROR';
     results.issues.push(`Fatal error: ${e.message}`);
+    console.error('ERROR:', e.message);
     try {
       await collectTrackingEvidence();
     } catch {}
