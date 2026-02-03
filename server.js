@@ -1,6 +1,5 @@
+cat > server.js << 'EOF'
 const express = require('express');
-const fs = require('fs');
-const path = require('path');
 const { trackingHealthCheckSite } = require('./health.runners.js');
 
 const app = express();
@@ -15,7 +14,7 @@ app.use((req, res, next) => {
   next();
 });
 
-// Main endpoint - this is what n8n will call
+// Main endpoint
 app.post('/health-check', async (req, res) => {
   try {
     const { url, client_id, client_name } = req.body;
@@ -44,7 +43,7 @@ app.post('/health-check', async (req, res) => {
   }
 });
 
-// Health check - to see if server is alive
+// Health check
 app.get('/health', (req, res) => {
   res.json({ 
     status: 'ok',
@@ -52,7 +51,8 @@ app.get('/health', (req, res) => {
   });
 });
 
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
+const PORT = 3000;
+app.listen(PORT, '0.0.0.0', () => {
   console.log(`Server running on port ${PORT}`);
 });
+EOF
