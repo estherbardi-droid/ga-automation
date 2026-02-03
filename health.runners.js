@@ -1,11 +1,225 @@
 // health.runners.js
+// Updated: accurate tag detection, reliable GA4 event extraction (GET+POST),
+// robust cookie handling (incl. iframes), CTA testing with proper counters,
+// HTTPS normalisation + redirect tracking, crawl contact pages, safer form testing.
+
 const { chromium } = require('playwright');
 
-async function trackingHealthCheckSite(url) {
-  console.log(`\n${'='.repeat(60)}`);
-  console.log(`🔍 Starting health check for: ${url}`);
-  console.log('='.repeat(60));
+function normaliseUrl(input) {
+  if (!input) return null;
+  let u = input.trim();
+  if (!/^https?:\/\//i.test(u)) u = `https://${u}`;
+  return u;
+}
 
+function toHttpsFirst(u) {
+  if (!u) return u;
+  return u.replace(/^http:\/\//i, 'https://');
+}
+
+function uniq(arr) {
+  return [...new Set((arr || []).filter(Boolean))];
+}
+
+function safeLower(s) {
+  return (s || '').toString().toLowerCase();
+}
+
+function isSameOrigin(a, b) {
+  try {
+    return new URL(a).origin === new URL(b).origin;
+  } catch {
+    return false;
+  }
+}
+
+async function scrollToFooter(page) {
+  try {
+    await page.evaluate(async () => {
+      const sleep = ms => new Promise(r => setTimeout(r, ms));
+      const max = Math.max(document.body.scrollHeight, document.documentElement.scrollHeight);
+      const step = Math.max(400, Math.floor(window.innerHeight * 0.8));
+      for (let y = 0; y < max; y += step) {
+        window.scrollTo(0, y);
+        await sleep(120);
+      }
+      window.scrollTo(0, max);
+    });
+  } catch {}
+}
+
+async function robustClick(locator, page, labelForLogs = '') {
+  // Goal: trigger site click handlers (GTM listeners), not OS handlers.
+  // Return: { ok: boolean, reason?: string }
+  try {
+    await locator.scrollIntoViewIfNeeded().catch(() => {});
+    await page.waitForTimeout(150);
+    const visible = await locator.isVisible().catch(() => false);
+    if (!visible) return { ok: false, reason: 'Not visible' };
+
+    // 1) trial click (checks actionability)
+    await locator.click({ trial: true, timeout: 2000 }).catch(() => {});
+    // 2) normal click
+    await locator.click({ timeout: 3000 }).catch(async () => {
+      // 3) fallback: dispatch click event via DOM
+      await locator.evaluate(el => {
+        const ev = new MouseEvent('click', { bubbles: true, cancelable: true, view: window });
+        el.dispatchEvent(ev);
+      }).catch(() => {});
+    });
+
+    await page.waitForTimeout(600);
+    return { ok: true };
+  } catch (e) {
+    return { ok: false, reason: `${labelForLogs} ${e.message}`.trim() };
+  }
+}
+
+async function clickConsentEverywhere(page) {
+  const selectors = [
+    '#onetrust-accept-btn-handler',
+    'button:has-text("Accept")',
+    'button:has-text("Accept all")',
+    'button:has-text("Accept All")',
+    'button:has-text("Allow all")',
+    'button:has-text("I Accept")',
+    'button:has-text("Agree")',
+    'button:has-text("OK")',
+    'button:has-text("Continue")',
+    '.cookie-accept',
+    '[aria-label*="accept" i]',
+    '[id*="accept" i]',
+    '[class*="accept" i]'
+  ];
+
+  let clicked = false;
+
+  // Try all frames (consent often in iframe)
+  const frames = page.frames();
+  for (const frame of frames) {
+    for (const sel of selectors) {
+      try {
+        const loc = frame.locator(sel).first();
+        const count = await loc.count().catch(() => 0);
+        if (!count) continue;
+
+        const vis = await loc.isVisible().catch(() => false);
+        if (!vis) continue;
+
+        await loc.click({ timeout: 3000 }).catch(async () => {
+          await loc.click({ force: true, timeout: 3000 }).catch(() => {});
+        });
+
+        clicked = true;
+        // wait for tracking init
+        await page.waitForTimeout(1200);
+        // don't early-return; sometimes there are two layers
+      } catch {}
+    }
+  }
+
+  return clicked;
+}
+
+function parseGA4FromUrl(url) {
+  try {
+    const u = new URL(url);
+    return {
+      en: u.searchParams.get('en') || null,
+      tid: u.searchParams.get('tid') || null
+    };
+  } catch {
+    return { en: null, tid: null };
+  }
+}
+
+function parseGA4FromPostData(postData) {
+  try {
+    // GA4 postData is often x-www-form-urlencoded
+    const params = new URLSearchParams(postData);
+    return {
+      en: params.get('en') || null,
+      tid: params.get('tid') || null
+    };
+  } catch {
+    return { en: null, tid: null };
+  }
+}
+
+function looksLikeGA4Collect(reqUrl) {
+  const u = reqUrl || '';
+  return (
+    u.includes('google-analytics.com') &&
+    (u.includes('/g/collect') || u.includes('/collect') || u.includes('/r/collect') || u.includes('/j/collect'))
+  );
+}
+
+function looksLikeGTM(reqUrl) {
+  const u = reqUrl || '';
+  return u.includes('googletagmanager.com') && u.includes('gtm.js');
+}
+
+function isTrackingRelated(reqUrl) {
+  const u = reqUrl || '';
+  return (
+    u.includes('google-analytics.com') ||
+    u.includes('googletagmanager.com') ||
+    u.includes('analytics.google.com') ||
+    u.includes('/g/collect') ||
+    u.includes('/collect') ||
+    u.includes('/r/collect') ||
+    u.includes('/j/collect') ||
+    u.includes('gtm.js') ||
+    u.includes('gtag')
+  );
+}
+
+function isRelevantEventName(eventName, patterns, ignoreExact = []) {
+  if (!eventName) return false;
+  const ev = safeLower(eventName);
+  if (ignoreExact.includes(ev)) return false;
+  return patterns.some(p => ev.includes(safeLower(p)));
+}
+
+const PHONE_EVENT_PATTERNS = [
+  'click_call',
+  'call_click',
+  'phone_click',
+  'click_phone',
+  'click_tel',
+  'tel_click',
+  'phone',
+  'call'
+];
+
+const EMAIL_EVENT_PATTERNS = [
+  'click_email',
+  'email_click',
+  'mailto_click',
+  'click_mail',
+  'mail_click',
+  'email',
+  'mailto'
+];
+
+const FORM_EVENT_PATTERNS = [
+  'form_submit',
+  'submit_form',
+  'form_submission',
+  'contact_form',
+  'generate_lead',
+  'lead',
+  'form_complete',
+  'form_success',
+  'contact',
+  'enquiry',
+  'quote',
+  'submit'
+];
+
+const IGNORE_EXACT_EVENTS = ['page_view', 'scroll', 'user_engagement', 'session_start', 'first_visit'];
+
+async function trackingHealthCheckSite(inputUrl) {
   const browser = await chromium.launch({
     headless: true,
     timeout: 90000,
@@ -13,9 +227,7 @@ async function trackingHealthCheckSite(url) {
       '--no-sandbox',
       '--disable-setuid-sandbox',
       '--disable-dev-shm-usage',
-      '--disable-gpu',
-      '--disable-web-security',
-      '--disable-features=IsolateOrigins,site-per-process'
+      '--disable-gpu'
     ]
   });
 
@@ -26,21 +238,66 @@ async function trackingHealthCheckSite(url) {
 
   const page = await context.newPage();
 
+  const startedAt = Date.now();
+  const MAX_RUNTIME = 10 * 60 * 1000;
+
+  // Beacon store
+  const allBeacons = [];
+  page.on('request', request => {
+    const reqUrl = request.url();
+    if (!isTrackingRelated(reqUrl)) return;
+
+    const ts = Date.now();
+    const entry = {
+      url: reqUrl,
+      timestamp: new Date(ts).toISOString(),
+      timestampMs: ts,
+      type: 'Other',
+      event_name: null,
+      measurement_id: null,
+      method: request.method()
+    };
+
+    if (looksLikeGTM(reqUrl)) {
+      entry.type = 'GTM';
+    }
+
+    if (looksLikeGA4Collect(reqUrl)) {
+      entry.type = 'GA4';
+      // GET params
+      const fromUrl = parseGA4FromUrl(reqUrl);
+      entry.event_name = fromUrl.en;
+      entry.measurement_id = fromUrl.tid;
+
+      // POST body override if present (more reliable)
+      const post = request.postData();
+      if (post) {
+        const fromPost = parseGA4FromPostData(post);
+        entry.event_name = fromPost.en || entry.event_name;
+        entry.measurement_id = fromPost.tid || entry.measurement_id;
+      }
+    }
+
+    allBeacons.push(entry);
+  });
+
   const results = {
-    url,
+    url: normaliseUrl(inputUrl),
+    final_url: null,
     timestamp: new Date().toISOString(),
     overall_status: 'HEALTHY',
     tracking: {
       gtm_found: false,
       ga4_found: false,
-      gtm_working: false, // "working" = loaded OR fired a network request
-      ga4_working: false,
+      gtm_loaded: false,      // evidence-based
+      ga4_collect_seen: false, // evidence-based
       gtm_ids: [],
       ga4_ids: [],
       evidence: {
+        total_beacons: 0,
         saw_gtm_js: false,
         saw_ga4_collect: false,
-        initial_ga4_events: []
+        ga4_events_captured: []
       }
     },
     ctas: {
@@ -73,799 +330,570 @@ async function trackingHealthCheckSite(url) {
     summary: ''
   };
 
-  // Track ALL network requests related to tracking
-  const allBeacons = [];
-  page.on('request', request => {
-    const reqUrl = request.url();
-
-    const isTracking =
-      reqUrl.includes('google-analytics.com') ||
-      reqUrl.includes('googletagmanager.com') ||
-      reqUrl.includes('analytics.google.com') ||
-      reqUrl.includes('/g/collect') ||
-      reqUrl.includes('/r/collect') ||
-      reqUrl.includes('/j/collect') ||
-      reqUrl.includes('gtm.js') ||
-      reqUrl.includes('gtag');
-
-    if (!isTracking) return;
-
-    let eventName = null;
-    let measurementId = null;
-    let beaconType = 'Other';
-
-    if (reqUrl.includes('/g/collect') || reqUrl.includes('/r/collect') || reqUrl.includes('/j/collect')) {
-      try {
-        const urlObj = new URL(reqUrl);
-        eventName = urlObj.searchParams.get('en');
-        measurementId = urlObj.searchParams.get('tid');
-        beaconType = 'GA4';
-      } catch (e) {
-        // Silent
-      }
-    } else if (reqUrl.includes('gtm.js')) {
-      beaconType = 'GTM';
-    }
-
-    allBeacons.push({
-      url: reqUrl,
-      timestamp: new Date().toISOString(),
-      timestampMs: Date.now(),
-      type: beaconType,
-      event_name: eventName,
-      measurement_id: measurementId
-    });
-  });
-
-  const pageLoadStart = Date.now();
-  const MAX_RUNTIME = 10 * 60 * 1000; // 10 minutes
-
-  // Event patterns
-  const PHONE_EVENT_PATTERNS = [
-    'click_call',
-    'call_click',
-    'phone_click',
-    'click_phone',
-    'click_line',
-    'click_tel',
-    'tel_click',
-    'call',
-    'phone'
-  ];
-
-  const EMAIL_EVENT_PATTERNS = [
-    'click_email',
-    'email_click',
-    'mailto_click',
-    'click_mail',
-    'mail_click',
-    'email',
-    'mailto'
-  ];
-
-  const FORM_EVENT_PATTERNS = [
-    'form_submit',
-    'submit_form',
-    'form_submission',
-    'contact_form',
-    'generate_lead',
-    'lead_form',
-    'form_complete',
-    'form_success',
-    'submit',
-    'contact',
-    'enquiry',
-    'quote_form'
-  ];
-
-  // Generic events to ignore (only exact match)
-  const IGNORE_EVENT_PATTERNS = ['page_view', 'scroll', 'user_engagement', 'session_start', 'first_visit'];
-
-  function matchesEventPattern(eventName, patterns) {
-    if (!eventName) return false;
-    const lowerEvent = eventName.toLowerCase();
-    return patterns.some(pattern => lowerEvent.includes(pattern.toLowerCase()));
-  }
-
-  function isRelevantEvent(eventName, relevantPatterns) {
-    if (!eventName) return false;
-
-    // Must match relevant patterns
-    if (!matchesEventPattern(eventName, relevantPatterns)) return false;
-
-    // Exclude exact generic events
-    const lowerEvent = eventName.toLowerCase();
-    if (IGNORE_EVENT_PATTERNS.includes(lowerEvent)) return false;
-
-    return true;
-  }
-
-  function sliceBeaconsSince(beforeCount, startMs, endMs) {
+  function beaconsBetween(beforeCount, startMs, endMs) {
     return allBeacons.slice(beforeCount).filter(b => b.timestampMs >= startMs && b.timestampMs <= endMs);
   }
 
-  async function tryClickConsent(pageInstance) {
-    const consentSelectors = [
-      'button:has-text("Accept")',
-      'button:has-text("Accept All")',
-      'button:has-text("Allow all")',
-      'button:has-text("I Accept")',
-      'button:has-text("OK")',
-      'button:has-text("Agree")',
-      'button:has-text("Allow")',
-      'button:has-text("Continue")',
-      '#onetrust-accept-btn-handler',
-      '.cookie-accept',
-      '[aria-label*="accept"]',
-      '[id*="accept"]'
-    ];
+  async function gotoWithHttpsFallback(url) {
+    const u0 = normaliseUrl(url);
+    const uHttps = toHttpsFirst(u0);
 
-    const frames = pageInstance.frames();
-    for (const frame of frames) {
-      for (const selector of consentSelectors) {
+    const attempts = [uHttps];
+    if (u0 !== uHttps) attempts.push(u0);
+
+    let lastErr = null;
+
+    for (const u of attempts) {
+      try {
+        const resp = await page.goto(u, { waitUntil: 'domcontentloaded', timeout: 45000 });
+        // Sometimes domcontentloaded still stalls on heavy sites; allow it
+        await page.waitForTimeout(800);
+        results.final_url = page.url();
+        return resp;
+      } catch (e) {
+        lastErr = e;
+        // fallback simpler load
         try {
-          const btn = await frame.$(selector);
-          if (!btn) continue;
-          const visible = await btn.isVisible().catch(() => false);
-          if (!visible) continue;
-
-          console.log('   ✅ Found consent button');
-          await btn.click({ timeout: 5000 }).catch(async () => {
-            await btn.click({ force: true });
-          });
-          console.log('   👆 Accepted cookies');
-          await pageInstance.waitForTimeout(2000);
-          return true;
-        } catch (e) {
-          // Continue
+          const resp2 = await page.goto(u, { waitUntil: 'commit', timeout: 30000 });
+          await page.waitForTimeout(800);
+          results.final_url = page.url();
+          return resp2;
+        } catch (e2) {
+          lastErr = e2;
         }
       }
     }
-    return false;
+
+    throw new Error(`Could not load page: ${lastErr ? lastErr.message : 'unknown error'}`);
+  }
+
+  async function detectTagsInDom() {
+    return page.evaluate(() => {
+      const tags = { gtm: [], ga4: [] };
+
+      const scripts = Array.from(document.querySelectorAll('script'));
+      for (const s of scripts) {
+        const content = (s.innerHTML || '') + (s.src || '');
+        const gtm = content.match(/GTM-[A-Z0-9]+/g);
+        if (gtm) tags.gtm.push(...gtm);
+
+        const ga4 = content.match(/G-[A-Z0-9]+/g);
+        if (ga4) tags.ga4.push(...ga4);
+      }
+
+      const noscripts = Array.from(document.querySelectorAll('noscript'));
+      for (const ns of noscripts) {
+        const gtm = (ns.innerHTML || '').match(/GTM-[A-Z0-9]+/g);
+        if (gtm) tags.gtm.push(...gtm);
+      }
+
+      return {
+        gtm: Array.from(new Set(tags.gtm)),
+        ga4: Array.from(new Set(tags.ga4)),
+        hasGtmObj: !!window.google_tag_manager,
+        hasGtagFn: !!window.gtag
+      };
+    });
+  }
+
+  async function collectTrackingEvidence() {
+    const beacons = allBeacons; // all so far
+    const sawGtm = beacons.some(b => b.type === 'GTM');
+    const ga4 = beacons.filter(b => b.type === 'GA4');
+    const sawGa4 = ga4.length > 0;
+
+    const events = uniq(ga4.map(b => b.event_name).filter(Boolean));
+
+    results.tracking.evidence.total_beacons = beacons.length;
+    results.tracking.evidence.saw_gtm_js = sawGtm;
+    results.tracking.evidence.saw_ga4_collect = sawGa4;
+    results.tracking.evidence.ga4_events_captured = events;
+
+    results.tracking.gtm_loaded = sawGtm;
+    results.tracking.ga4_collect_seen = sawGa4;
+  }
+
+  async function crawlContactPages(baseUrl) {
+    const candidates = ['/contact', '/contact-us', '/get-in-touch', '/enquiry', '/quote', '/book'];
+    const visited = [];
+
+    for (const path of candidates) {
+      if (Date.now() - startedAt > MAX_RUNTIME) break;
+
+      const next = new URL(path, baseUrl).toString();
+      if (visited.includes(next)) continue;
+
+      try {
+        // Only crawl within same origin
+        if (!isSameOrigin(baseUrl, next)) continue;
+        await page.goto(next, { waitUntil: 'domcontentloaded', timeout: 20000 });
+        await page.waitForTimeout(1200);
+        await clickConsentEverywhere(page).catch(() => {});
+        await page.waitForTimeout(800);
+        await scrollToFooter(page);
+        visited.push(next);
+      } catch {
+        // ignore
+      }
+    }
+  }
+
+  // Gather CTAs from current page
+  async function findCtas() {
+    // ensure footer loaded
+    await scrollToFooter(page);
+
+    const phoneLocators = page.locator('a[href^="tel:"]');
+    const emailLocators = page.locator('a[href^="mailto:"]');
+
+    // forms: include visible forms, plus forms that become visible after scroll
+    const formLocators = page.locator('form');
+
+    const phoneCount = await phoneLocators.count().catch(() => 0);
+    const emailCount = await emailLocators.count().catch(() => 0);
+
+    // only count visible forms (some pages have hidden/templated forms)
+    const formCount = await formLocators.count().catch(() => 0);
+    let visibleForms = [];
+    for (let i = 0; i < Math.min(formCount, 25); i++) {
+      const f = formLocators.nth(i);
+      const vis = await f.isVisible().catch(() => false);
+      if (vis) visibleForms.push(f);
+    }
+
+    return {
+      phoneLocators,
+      emailLocators,
+      visibleForms,
+      phoneCount,
+      emailCount,
+      visibleFormCount: visibleForms.length
+    };
+  }
+
+  async function testPhoneLinks(phoneLocators, max = 10) {
+    const count = await phoneLocators.count().catch(() => 0);
+    results.ctas.phone.total_found += count;
+
+    const limit = Math.min(count, max);
+    for (let i = 0; i < limit; i++) {
+      if (Date.now() - startedAt > MAX_RUNTIME) break;
+
+      const loc = phoneLocators.nth(i);
+      const href = await loc.getAttribute('href').catch(() => null);
+      const text = (await loc.textContent().catch(() => ''))?.trim() || '';
+
+      const before = allBeacons.length;
+      const t0 = Date.now();
+
+      // IMPORTANT: count as tested even if click fails
+      results.ctas.phone.total_tested++;
+
+      const clickRes = await robustClick(loc, page, 'phone');
+      await page.waitForTimeout(1200);
+
+      const t1 = Date.now();
+      const newBeacons = beaconsBetween(before, t0, t1);
+      const ga4Events = uniq(newBeacons.filter(b => b.type === 'GA4').map(b => b.event_name).filter(Boolean));
+      const relevant = ga4Events.filter(ev => isRelevantEventName(ev, PHONE_EVENT_PATTERNS, IGNORE_EXACT_EVENTS));
+
+      if (!clickRes.ok) {
+        // click failed: still record events if any fired
+        if (relevant.length > 0) {
+          results.ctas.phone.working++;
+          results.ctas.phone.working_details.push({
+            link: href,
+            text,
+            relevant_events: relevant,
+            events_fired: ga4Events,
+            note: `click_failed_but_events_fired: ${clickRes.reason || 'unknown'}`
+          });
+        } else {
+          results.ctas.phone.broken++;
+          results.ctas.phone.broken_details.push({
+            link: href,
+            text,
+            reason: `Click failed: ${clickRes.reason || 'unknown'}`,
+            events_fired: ga4Events
+          });
+        }
+        continue;
+      }
+
+      if (relevant.length > 0) {
+        results.ctas.phone.working++;
+        results.ctas.phone.working_details.push({
+          link: href,
+          text,
+          relevant_events: relevant,
+          events_fired: ga4Events
+        });
+      } else {
+        results.ctas.phone.broken++;
+        results.ctas.phone.broken_details.push({
+          link: href,
+          text,
+          reason: ga4Events.length ? `No phone event. Events: ${ga4Events.join(', ')}` : 'No GA4 event fired',
+          events_fired: ga4Events
+        });
+      }
+    }
+  }
+
+  async function testEmailLinks(emailLocators, max = 10) {
+    const count = await emailLocators.count().catch(() => 0);
+    results.ctas.email.total_found += count;
+
+    const limit = Math.min(count, max);
+    for (let i = 0; i < limit; i++) {
+      if (Date.now() - startedAt > MAX_RUNTIME) break;
+
+      const loc = emailLocators.nth(i);
+      const href = await loc.getAttribute('href').catch(() => null);
+      const text = (await loc.textContent().catch(() => ''))?.trim() || '';
+
+      const before = allBeacons.length;
+      const t0 = Date.now();
+
+      results.ctas.email.total_tested++;
+
+      const clickRes = await robustClick(loc, page, 'email');
+      await page.waitForTimeout(1200);
+
+      const t1 = Date.now();
+      const newBeacons = beaconsBetween(before, t0, t1);
+      const ga4Events = uniq(newBeacons.filter(b => b.type === 'GA4').map(b => b.event_name).filter(Boolean));
+      const relevant = ga4Events.filter(ev => isRelevantEventName(ev, EMAIL_EVENT_PATTERNS, IGNORE_EXACT_EVENTS));
+
+      if (!clickRes.ok) {
+        if (relevant.length > 0) {
+          results.ctas.email.working++;
+          results.ctas.email.working_details.push({
+            link: href,
+            text,
+            relevant_events: relevant,
+            events_fired: ga4Events,
+            note: `click_failed_but_events_fired: ${clickRes.reason || 'unknown'}`
+          });
+        } else {
+          results.ctas.email.broken++;
+          results.ctas.email.broken_details.push({
+            link: href,
+            text,
+            reason: `Click failed: ${clickRes.reason || 'unknown'}`,
+            events_fired: ga4Events
+          });
+        }
+        continue;
+      }
+
+      if (relevant.length > 0) {
+        results.ctas.email.working++;
+        results.ctas.email.working_details.push({
+          link: href,
+          text,
+          relevant_events: relevant,
+          events_fired: ga4Events
+        });
+      } else {
+        results.ctas.email.broken++;
+        results.ctas.email.broken_details.push({
+          link: href,
+          text,
+          reason: ga4Events.length ? `No email event. Events: ${ga4Events.join(', ')}` : 'No GA4 event fired',
+          events_fired: ga4Events
+        });
+      }
+    }
+  }
+
+  async function detectCaptchaOnPage() {
+    try {
+      const hasRecaptcha = await page.locator('iframe[src*="recaptcha"]').count().catch(() => 0);
+      const hasHcaptcha = await page.locator('iframe[src*="hcaptcha"]').count().catch(() => 0);
+      const hasTurnstile = await page.locator('iframe[src*="challenges.cloudflare.com"]').count().catch(() => 0);
+      return hasRecaptcha > 0 || hasHcaptcha > 0 || hasTurnstile > 0;
+    } catch {
+      return false;
+    }
+  }
+
+  async function tryFillForm(form) {
+    // Fill a subset safely (no “real” emails/phones).
+    // Return { filledFields, notes[] }
+    const notes = [];
+    let filled = 0;
+
+    const hasCaptcha = await detectCaptchaOnPage();
+    if (hasCaptcha) notes.push('captcha_detected');
+
+    // Prefer visible fields only
+    const fields = await form.locator('input:visible, textarea:visible, select:visible').all().catch(() => []);
+    for (const field of fields.slice(0, 25)) {
+      try {
+        const tag = await field.evaluate(el => el.tagName.toLowerCase()).catch(() => '');
+        const type = safeLower(await field.getAttribute('type').catch(() => ''));
+        const name = safeLower(await field.getAttribute('name').catch(() => ''));
+        const placeholder = safeLower(await field.getAttribute('placeholder').catch(() => ''));
+
+        // Skip password/file
+        if (type === 'password' || type === 'file') continue;
+
+        if (tag === 'select') {
+          // Select first non-empty option
+          await field.selectOption({ index: 1 }).catch(() => {});
+          filled++;
+          continue;
+        }
+
+        if (tag === 'textarea') {
+          await field.fill('Test message').catch(() => {});
+          filled++;
+          continue;
+        }
+
+        if (type === 'checkbox') {
+          await field.check().catch(() => {});
+          filled++;
+          continue;
+        }
+
+        const looksEmail = type === 'email' || name.includes('email') || placeholder.includes('email');
+        const looksPhone = type === 'tel' || name.includes('phone') || name.includes('tel') || placeholder.includes('phone');
+        const looksName = name.includes('name') || placeholder.includes('name');
+
+        if (looksEmail) {
+          await field.fill('test@example.com').catch(() => {});
+          filled++;
+        } else if (looksPhone) {
+          await field.fill('5551234567').catch(() => {});
+          filled++;
+        } else if (looksName) {
+          await field.fill('Test User').catch(() => {});
+          filled++;
+        } else if (type === 'text' || type === 'search' || type === '' || type === 'url') {
+          await field.fill('Test').catch(() => {});
+          filled++;
+        }
+      } catch {}
+    }
+
+    return { filledFields: filled, notes };
+  }
+
+  async function testForms(visibleForms, max = 3) {
+    results.ctas.forms.total_found += visibleForms.length;
+
+    const limit = Math.min(visibleForms.length, max);
+    for (let i = 0; i < limit; i++) {
+      if (Date.now() - startedAt > MAX_RUNTIME) break;
+
+      const form = visibleForms[i];
+
+      const before = allBeacons.length;
+      const t0 = Date.now();
+
+      // Count as tested even if we can’t submit
+      results.ctas.forms.total_tested++;
+
+      await form.scrollIntoViewIfNeeded().catch(() => {});
+      await page.waitForTimeout(300);
+
+      const { filledFields, notes } = await tryFillForm(form);
+
+      // Try to trigger tracking even if we don’t submit:
+      // - focus a field
+      // - click submit if available (but we accept that captcha may block)
+      try {
+        const firstInput = form.locator('input:visible, textarea:visible').first();
+        const c = await firstInput.count().catch(() => 0);
+        if (c) {
+          await firstInput.focus().catch(() => {});
+          await page.waitForTimeout(200);
+        }
+      } catch {}
+
+      // Attempt submit click (best-effort)
+      let submitClicked = false;
+      let submitReason = null;
+
+      try {
+        const submit = form.locator(
+          'button[type="submit"], input[type="submit"], button:has-text("Submit"), button:has-text("Send"), button:has-text("Enquire"), button:has-text("Enquiry")'
+        ).first();
+
+        const has = await submit.count().catch(() => 0);
+        if (has) {
+          const vis = await submit.isVisible().catch(() => false);
+          if (vis) {
+            const res = await robustClick(submit, page, 'form_submit');
+            submitClicked = res.ok;
+            if (!res.ok) submitReason = res.reason || 'submit_click_failed';
+          } else {
+            submitReason = 'submit_not_visible';
+          }
+        } else {
+          submitReason = 'no_submit_button_found';
+        }
+      } catch (e) {
+        submitReason = `submit_error: ${e.message}`;
+      }
+
+      await page.waitForTimeout(1800);
+      const t1 = Date.now();
+
+      const newBeacons = beaconsBetween(before, t0, t1);
+      const ga4Events = uniq(newBeacons.filter(b => b.type === 'GA4').map(b => b.event_name).filter(Boolean));
+      const relevant = ga4Events.filter(ev => isRelevantEventName(ev, FORM_EVENT_PATTERNS, IGNORE_EXACT_EVENTS));
+
+      if (relevant.length > 0) {
+        results.ctas.forms.working++;
+        results.ctas.forms.working_details.push({
+          form_index: i + 1,
+          relevant_events: relevant,
+          events_fired: ga4Events,
+          filled_fields: filledFields,
+          submit_clicked: submitClicked,
+          notes
+        });
+      } else {
+        results.ctas.forms.broken++;
+        results.ctas.forms.broken_details.push({
+          form_index: i + 1,
+          reason: ga4Events.length
+            ? `No form event. Events: ${ga4Events.join(', ')}`
+            : `No GA4 event fired${submitReason ? ` (${submitReason})` : ''}`,
+          events_fired: ga4Events,
+          filled_fields: filledFields,
+          submit_clicked: submitClicked,
+          notes
+        });
+      }
+    }
   }
 
   try {
-    // ============================================================
-    // PHASE 1: LOAD PAGE & DETECT TAGS
-    // ============================================================
-    console.log('\n📍 PHASE 1: Loading page and detecting tags...');
+    // ------------------------------------------------------------
+    // 1) Load (HTTPS first), accept consent, wait for tracking
+    // ------------------------------------------------------------
+    const target = normaliseUrl(inputUrl);
+    results.url = target;
 
-    try {
-      await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 45000 });
-      console.log('   ✅ Page loaded');
-    } catch (gotoError) {
-      console.log('   ⚠️  Timeout, trying simpler load...');
-      try {
-        await page.goto(url, { waitUntil: 'commit', timeout: 30000 });
-        console.log('   ✅ Page loaded (basic)');
-      } catch (retryError) {
-        throw new Error(`Could not load page: ${retryError.message}`);
-      }
-    }
+    await gotoWithHttpsFallback(target);
+    await clickConsentEverywhere(page).catch(() => {});
+    await page.waitForTimeout(2000);
+    await scrollToFooter(page);
 
-    console.log('   ⏳ Waiting for tracking (5s)...');
-    await page.waitForTimeout(5000);
+    // ------------------------------------------------------------
+    // 2) Detect tags (DOM + network evidence)
+    // ------------------------------------------------------------
+    const tagData = await detectTagsInDom().catch(() => ({
+      gtm: [],
+      ga4: [],
+      hasGtmObj: false,
+      hasGtagFn: false
+    }));
 
-    const tagData = await page.evaluate(() => {
-      const tags = { gtm: [], ga4: [], aw: [] };
+    // Let tracking settle a bit more
+    await page.waitForTimeout(1500);
+    await collectTrackingEvidence();
 
-      const scripts = Array.from(document.querySelectorAll('script'));
-      scripts.forEach(script => {
-        const content = (script.innerHTML || '') + (script.src || '');
-        const gtmMatches = content.match(/GTM-[A-Z0-9]+/g);
-        if (gtmMatches) tags.gtm.push(...gtmMatches);
+    // DOM IDs
+    results.tracking.gtm_ids = uniq(tagData.gtm);
+    results.tracking.ga4_ids = uniq(tagData.ga4);
 
-        const ga4Matches = content.match(/G-[A-Z0-9]+/g);
-        if (ga4Matches) tags.ga4.push(...ga4Matches);
+    // Found logic: DOM IDs OR network evidence
+    const sawGtm = results.tracking.evidence.saw_gtm_js;
+    const sawGa4 = results.tracking.evidence.saw_ga4_collect;
 
-        const awMatches = content.match(/AW-[0-9]+/g);
-        if (awMatches) tags.aw.push(...awMatches);
-      });
+    results.tracking.gtm_found = results.tracking.gtm_ids.length > 0 || sawGtm || tagData.hasGtmObj;
+    results.tracking.ga4_found = results.tracking.ga4_ids.length > 0 || sawGa4 || tagData.hasGtagFn;
 
-      const noscripts = Array.from(document.querySelectorAll('noscript'));
-      noscripts.forEach(ns => {
-        const gtmMatches = (ns.innerHTML || '').match(/GTM-[A-Z0-9]+/g);
-        if (gtmMatches) tags.gtm.push(...gtmMatches);
-      });
+    // Loaded/firing logic: network evidence first
+    results.tracking.gtm_loaded = sawGtm || tagData.hasGtmObj;
+    results.tracking.ga4_collect_seen = sawGa4;
 
-      const gtmLoaded = !!window.google_tag_manager;
-      const ga4Loaded = !!window.gtag; // keep this GA4-specific
-
-      return {
-        gtm: [...new Set(tags.gtm)],
-        ga4: [...new Set(tags.ga4)],
-        gtmLoaded,
-        ga4Loaded
-      };
-    });
-
-    // Network evidence for "working"
-    const initialBeacons = allBeacons.filter(b => b.timestampMs >= pageLoadStart);
-    const sawGtmJs = initialBeacons.some(b => b.type === 'GTM');
-    const initialGa4Events = initialBeacons
-      .filter(b => b.type === 'GA4' && b.event_name)
-      .map(b => b.event_name);
-
-    const sawGa4Collect = initialGa4Events.length > 0;
-
-    results.tracking.evidence.saw_gtm_js = sawGtmJs;
-    results.tracking.evidence.saw_ga4_collect = sawGa4Collect;
-    results.tracking.evidence.initial_ga4_events = [...new Set(initialGa4Events)];
-
-    // Found = via DOM regex OR via actual GA4 beacon presence
-    results.tracking.gtm_found = tagData.gtm.length > 0 || sawGtmJs;
-    results.tracking.ga4_found = tagData.ga4.length > 0 || sawGa4Collect;
-
-    results.tracking.gtm_ids = tagData.gtm;
-    results.tracking.ga4_ids = tagData.ga4;
-
-    // Working = loaded flag OR network evidence
-    results.tracking.gtm_working = results.tracking.gtm_found && (tagData.gtmLoaded || sawGtmJs);
-    results.tracking.ga4_working = results.tracking.ga4_found && (tagData.ga4Loaded || sawGa4Collect);
-
-    console.log('\n📊 Tags:');
-    console.log(`   GTM: ${results.tracking.gtm_found ? '✅ ' + (tagData.gtm.join(', ') || '(detected via network)') : '❌ Not found'}`);
-    console.log(`   GA4: ${results.tracking.ga4_found ? '✅ ' + (tagData.ga4.join(', ') || '(detected via network)') : '❌ Not found'}`);
-    if (results.tracking.evidence.initial_ga4_events.length) {
-      console.log(`   GA4 events seen on load: ${results.tracking.evidence.initial_ga4_events.join(', ')}`);
-    }
-
-    // Critical issue: no tracking tags
     if (!results.tracking.gtm_found && !results.tracking.ga4_found) {
-      results.issues.push('❌ CRITICAL: No tracking tags found on site');
-      results.overall_status = 'FAILING';
+      results.issues.push('❌ CRITICAL: No GTM or GA4 detected (DOM + network)');
     }
 
-    // ============================================================
-    // PHASE 2: COOKIE CONSENT
-    // ============================================================
-    console.log('\n🍪 PHASE 2: Cookie consent...');
+    // ------------------------------------------------------------
+    // 3) Crawl contact-like pages for CTAs and test
+    // ------------------------------------------------------------
+    // We test on current page AND on common contact paths.
+    const baseUrl = results.final_url || page.url();
+    const origin = new URL(baseUrl).origin;
 
-    try {
-      const clicked = await tryClickConsent(page);
-      if (!clicked) console.log('   ℹ️  No consent banner (or not detected)');
-      console.log('   ⏳ Waiting for tracking after consent (2s)...');
-      await page.waitForTimeout(2000);
-    } catch (e) {
-      console.log(`   ⚠️  Consent error: ${e.message}`);
-    }
+    // Test on homepage/current page first
+    let ctas = await findCtas();
+    await testPhoneLinks(ctas.phoneLocators);
+    await testEmailLinks(ctas.emailLocators);
+    await testForms(ctas.visibleForms);
 
-    // ============================================================
-    // PHASE 3: TEST CTAs
-    // ============================================================
-    console.log('\n🎯 PHASE 3: Testing CTAs...');
+    // Crawl contact pages (same origin) then test again (adds coverage)
+    await crawlContactPages(origin);
 
-    if (Date.now() - pageLoadStart > MAX_RUNTIME) {
-      throw new Error('Max runtime exceeded');
-    }
+    // Re-find & test on the last crawled page (plus new CTAs)
+    ctas = await findCtas();
+    await testPhoneLinks(ctas.phoneLocators);
+    await testEmailLinks(ctas.emailLocators);
+    await testForms(ctas.visibleForms);
 
-    // --- PHONE LINKS ---
-    console.log('\n📞 Phone links...');
-    try {
-      const phoneLinks = await page.$$('a[href^="tel:"]');
-      results.ctas.phone.total_found = phoneLinks.length;
-
-      if (phoneLinks.length === 0) {
-        console.log('   ℹ️  No phone links found');
-      } else {
-        console.log(`   Found ${phoneLinks.length} phone link(s)`);
-
-        for (let i = 0; i < Math.min(phoneLinks.length, 10); i++) {
-          if (Date.now() - pageLoadStart > MAX_RUNTIME) break;
-
-          const link = phoneLinks[i];
-          let href = null;
-          let linkText = 'unknown';
-
-          try {
-            href = await link.getAttribute('href');
-            linkText = ((await link.textContent().catch(() => '')) || '').trim() || 'unknown';
-          } catch (e) {
-            continue;
-          }
-
-          console.log(`   Testing ${i + 1}: ${linkText}`);
-
-          const beforeBeaconCount = allBeacons.length;
-          const testStartTime = Date.now();
-
-          try {
-            await link.scrollIntoViewIfNeeded().catch(() => {});
-            await page.waitForTimeout(500);
-
-            const visible = await link.isVisible().catch(() => false);
-            if (!visible) {
-              console.log('      ⚠️  Not visible, skipping');
-              continue;
-            }
-
-            await link.click({ force: true, timeout: 5000 });
-            await page.waitForTimeout(3000);
-          } catch (clickError) {
-            console.log('      ❌ Click failed');
-            results.ctas.phone.total_tested++;
-            results.ctas.phone.broken++;
-            results.ctas.phone.broken_details.push({
-              link: href,
-              text: linkText,
-              reason: 'Could not click',
-              events_fired: []
-            });
-            continue;
-          }
-
-          const testEndTime = Date.now();
-          results.ctas.phone.total_tested++;
-
-          const newBeacons = sliceBeaconsSince(beforeBeaconCount, testStartTime, testEndTime);
-          const allGA4Events = newBeacons
-            .filter(b => b.type === 'GA4' && b.event_name)
-            .map(b => b.event_name);
-
-          const relevantEvents = allGA4Events.filter(ev => isRelevantEvent(ev, PHONE_EVENT_PATTERNS));
-
-          if (relevantEvents.length > 0) {
-            results.ctas.phone.working++;
-            results.ctas.phone.working_details.push({
-              link: href,
-              text: linkText,
-              events_fired: [...new Set(allGA4Events)],
-              relevant_events: [...new Set(relevantEvents)]
-            });
-            console.log(`      ✅ Working: ${[...new Set(relevantEvents)].join(', ')}`);
-          } else {
-            results.ctas.phone.broken++;
-            results.ctas.phone.broken_details.push({
-              link: href,
-              text: linkText,
-              reason:
-                allGA4Events.length > 0
-                  ? `Only non-phone events: ${[...new Set(allGA4Events)].join(', ')}`
-                  : 'No GA4 event fired',
-              events_fired: [...new Set(allGA4Events)]
-            });
-            console.log('      ❌ No relevant GA4 event');
-          }
-        }
-      }
-    } catch (e) {
-      console.log(`   ⚠️  Error: ${e.message}`);
-    }
-
-    // --- EMAIL LINKS ---
-    console.log('\n📧 Email links...');
-    try {
-      if (Date.now() - pageLoadStart > MAX_RUNTIME) {
-        console.log('   ⚠️  Skipping (timeout)');
-      } else {
-        const emailLinks = await page.$$('a[href^="mailto:"]');
-        results.ctas.email.total_found = emailLinks.length;
-
-        if (emailLinks.length === 0) {
-          console.log('   ℹ️  No email links found');
-        } else {
-          console.log(`   Found ${emailLinks.length} email link(s)`);
-
-          for (let i = 0; i < Math.min(emailLinks.length, 10); i++) {
-            if (Date.now() - pageLoadStart > MAX_RUNTIME) break;
-
-            const link = emailLinks[i];
-            let href = null;
-            let linkText = 'unknown';
-
-            try {
-              href = await link.getAttribute('href');
-              linkText = ((await link.textContent().catch(() => '')) || '').trim() || 'unknown';
-            } catch (e) {
-              continue;
-            }
-
-            console.log(`   Testing ${i + 1}: ${linkText}`);
-
-            const beforeBeaconCount = allBeacons.length;
-            const testStartTime = Date.now();
-
-            try {
-              await link.scrollIntoViewIfNeeded().catch(() => {});
-              await page.waitForTimeout(500);
-
-              const visible = await link.isVisible().catch(() => false);
-              if (!visible) {
-                console.log('      ⚠️  Not visible, skipping');
-                continue;
-              }
-
-              await link.hover().catch(() => {});
-              await page.waitForTimeout(200);
-              await link.click({ force: true, timeout: 5000 });
-              await page.waitForTimeout(3000);
-            } catch (clickError) {
-              console.log('      ❌ Click failed');
-              results.ctas.email.total_tested++;
-              results.ctas.email.broken++;
-              results.ctas.email.broken_details.push({
-                link: href,
-                text: linkText,
-                reason: 'Could not click',
-                events_fired: []
-              });
-              continue;
-            }
-
-            const testEndTime = Date.now();
-            results.ctas.email.total_tested++;
-
-            const newBeacons = sliceBeaconsSince(beforeBeaconCount, testStartTime, testEndTime);
-            const allGA4Events = newBeacons
-              .filter(b => b.type === 'GA4' && b.event_name)
-              .map(b => b.event_name);
-
-            const relevantEvents = allGA4Events.filter(ev => isRelevantEvent(ev, EMAIL_EVENT_PATTERNS));
-
-            if (relevantEvents.length > 0) {
-              results.ctas.email.working++;
-              results.ctas.email.working_details.push({
-                link: href,
-                text: linkText,
-                events_fired: [...new Set(allGA4Events)],
-                relevant_events: [...new Set(relevantEvents)]
-              });
-              console.log(`      ✅ Working: ${[...new Set(relevantEvents)].join(', ')}`);
-            } else {
-              results.ctas.email.broken++;
-              results.ctas.email.broken_details.push({
-                link: href,
-                text: linkText,
-                reason:
-                  allGA4Events.length > 0
-                    ? `Only non-email events: ${[...new Set(allGA4Events)].join(', ')}`
-                    : 'No GA4 event fired',
-                events_fired: [...new Set(allGA4Events)]
-              });
-              console.log('      ❌ No relevant GA4 event');
-            }
-          }
-        }
-      }
-    } catch (e) {
-      console.log(`   ⚠️  Error: ${e.message}`);
-    }
-
-    // --- FORMS ---
-    console.log('\n📝 Forms...');
-    try {
-      if (Date.now() - pageLoadStart > MAX_RUNTIME) {
-        console.log('   ⚠️  Skipping (timeout)');
-      } else {
-        let allForms = [];
-        const originalUrl = page.url();
-
-        // Strategy 1: visible forms
-        let forms = await page.$$('form:visible');
-        allForms.push(...forms);
-
-        // Strategy 2: scroll
-        if (forms.length === 0) {
-          await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight)).catch(() => {});
-          await page.waitForTimeout(1500);
-          forms = await page.$$('form:visible');
-          allForms.push(...forms);
-        }
-
-        // Strategy 3: click likely triggers
-        if (allForms.length === 0) {
-          const triggers = [
-            'button:has-text("Contact")',
-            'a:has-text("Contact")',
-            'button:has-text("Get Quote")',
-            'a:has-text("Get Quote")',
-            'button:has-text("Enquiry")',
-            'a:has-text("Enquiry")'
-          ];
-
-          for (const selector of triggers) {
-            try {
-              const trigger = await page.$(selector);
-              if (trigger && (await trigger.isVisible().catch(() => false))) {
-                await trigger.click({ timeout: 3000 }).catch(() => trigger.click({ force: true }));
-                await page.waitForTimeout(1500);
-                forms = await page.$$('form:visible');
-                if (forms.length > 0) {
-                  allForms.push(...forms);
-                  break;
-                }
-              }
-            } catch (e) {
-              // continue
-            }
-          }
-        }
-
-        // Strategy 4: contact pages
-        if (allForms.length === 0 && Date.now() - pageLoadStart < MAX_RUNTIME) {
-          const baseUrl = new URL(originalUrl).origin;
-          for (const path of ['/contact', '/contact-us', '/get-in-touch']) {
-            try {
-              const response = await page.goto(baseUrl + path, {
-                waitUntil: 'domcontentloaded',
-                timeout: 15000
-              });
-              if (response && response.ok()) {
-                await page.waitForTimeout(2000);
-                forms = await page.$$('form:visible');
-                if (forms.length > 0) {
-                  allForms.push(...forms);
-                  break;
-                }
-              }
-            } catch (e) {
-              // continue
-            }
-          }
-        }
-
-        // Deduplicate forms (best-effort)
-        const uniqueForms = [];
-        const seen = new Set();
-        for (const form of allForms) {
-          try {
-            const key = await form.evaluate(el => el.id || el.getAttribute('name') || el.className || el.outerHTML.slice(0, 120));
-            if (!seen.has(key)) {
-              seen.add(key);
-              uniqueForms.push(form);
-            }
-          } catch (e) {
-            // stale
-          }
-        }
-
-        results.ctas.forms.total_found = uniqueForms.length;
-
-        if (uniqueForms.length === 0) {
-          console.log('   ℹ️  No forms found');
-        } else {
-          console.log(`   Found ${uniqueForms.length} form(s)`);
-
-          for (let i = 0; i < Math.min(uniqueForms.length, 3); i++) {
-            if (Date.now() - pageLoadStart > MAX_RUNTIME) break;
-
-            const form = uniqueForms[i];
-            console.log(`   Testing form ${i + 1}...`);
-
-            const visible = await form.isVisible().catch(() => false);
-            if (!visible) {
-              console.log('      ⚠️  Not visible, skipping');
-              continue;
-            }
-
-            const beforeBeaconCount = allBeacons.length;
-            const testStartTime = Date.now();
-
-            try {
-              await form.scrollIntoViewIfNeeded().catch(() => {});
-              await page.waitForTimeout(500);
-
-              const inputs = await form.$$('input:visible, textarea:visible, select:visible');
-              let filledFields = 0;
-
-              for (const input of inputs) {
-                try {
-                  const tag = await input.evaluate(el => el.tagName.toLowerCase());
-                  const inputType = (await input.getAttribute('type')) || '';
-                  const inputName = (await input.getAttribute('name')) || '';
-                  const placeholder = (await input.getAttribute('placeholder')) || '';
-
-                  const nameL = inputName.toLowerCase();
-                  const phL = placeholder.toLowerCase();
-                  const typeL = inputType.toLowerCase();
-
-                  if (tag === 'select') {
-                    // Best-effort: pick first non-empty option
-                    await input.selectOption({ index: 1 }).catch(() => {});
-                    filledFields++;
-                  } else if (tag === 'textarea') {
-                    await input.fill('Test message').catch(() => {});
-                    filledFields++;
-                  } else if (typeL === 'checkbox') {
-                    await input.check().catch(() => {});
-                    filledFields++;
-                  } else if (typeL === 'email' || nameL.includes('email') || phL.includes('email')) {
-                    await input.fill('test@example.com').catch(() => {});
-                    filledFields++;
-                  } else if (typeL === 'tel' || nameL.includes('phone') || phL.includes('phone') || nameL.includes('tel')) {
-                    await input.fill('5551234567').catch(() => {});
-                    filledFields++;
-                  } else if (nameL.includes('name') || phL.includes('name')) {
-                    await input.fill('Test User').catch(() => {});
-                    filledFields++;
-                  } else if (typeL === 'text' || typeL === '' || typeL === 'search') {
-                    await input.fill('Test').catch(() => {});
-                    filledFields++;
-                  }
-
-                  await page.waitForTimeout(150);
-                } catch (e) {
-                  // skip
-                }
-              }
-
-              console.log(`      Filled ${filledFields} field(s)`);
-
-              if (filledFields === 0) {
-                results.ctas.forms.total_tested++;
-                results.ctas.forms.broken++;
-                results.ctas.forms.broken_details.push({
-                  form_index: i + 1,
-                  reason: 'Could not fill any fields',
-                  events_fired: []
-                });
-                console.log('      ❌ Could not fill fields');
-                continue;
-              }
-
-              const submitBtn = await form.$(
-                'button[type="submit"], input[type="submit"], button:has-text("Submit"), button:has-text("Send"), button:has-text("Enquire")'
-              );
-
-              if (!submitBtn || !(await submitBtn.isVisible().catch(() => false))) {
-                results.ctas.forms.total_tested++;
-                results.ctas.forms.broken++;
-                results.ctas.forms.broken_details.push({
-                  form_index: i + 1,
-                  reason: 'No visible submit button',
-                  events_fired: []
-                });
-                console.log('      ❌ No submit button');
-                continue;
-              }
-
-              console.log('      👆 Submitting...');
-              await submitBtn.click({ timeout: 5000 }).catch(async () => {
-                await submitBtn.click({ force: true });
-              });
-
-              await page.waitForTimeout(5000);
-
-              const testEndTime = Date.now();
-              results.ctas.forms.total_tested++;
-
-              const newBeacons = sliceBeaconsSince(beforeBeaconCount, testStartTime, testEndTime);
-              const allGA4Events = newBeacons
-                .filter(b => b.type === 'GA4' && b.event_name)
-                .map(b => b.event_name);
-
-              const relevantEvents = allGA4Events.filter(ev => isRelevantEvent(ev, FORM_EVENT_PATTERNS));
-
-              if (relevantEvents.length > 0) {
-                results.ctas.forms.working++;
-                results.ctas.forms.working_details.push({
-                  form_index: i + 1,
-                  events_fired: [...new Set(allGA4Events)],
-                  relevant_events: [...new Set(relevantEvents)]
-                });
-                console.log(`      ✅ Working: ${[...new Set(relevantEvents)].join(', ')}`);
-              } else {
-                results.ctas.forms.broken++;
-                results.ctas.forms.broken_details.push({
-                  form_index: i + 1,
-                  reason:
-                    allGA4Events.length > 0
-                      ? `Only non-form events: ${[...new Set(allGA4Events)].join(', ')}`
-                      : 'No GA4 event fired',
-                  events_fired: [...new Set(allGA4Events)]
-                });
-                console.log('      ❌ No relevant GA4 event');
-              }
-            } catch (e) {
-              results.ctas.forms.total_tested++;
-              results.ctas.forms.broken++;
-              results.ctas.forms.broken_details.push({
-                form_index: i + 1,
-                reason: `Error during form test: ${e.message}`,
-                events_fired: []
-              });
-              console.log(`      ⚠️  Error: ${e.message}`);
-            }
-          }
-        }
-      }
-    } catch (e) {
-      console.log(`   ⚠️  Error: ${e.message}`);
-    }
-
-    // ============================================================
-    // PHASE 4: ANALYZE & CREATE ISSUES
-    // ============================================================
-    console.log('\n📋 PHASE 4: Analysis...');
-
-    const totalCTAs =
+    // ------------------------------------------------------------
+    // 4) Final analysis + status
+    // ------------------------------------------------------------
+    const totalTested =
       results.ctas.phone.total_tested + results.ctas.email.total_tested + results.ctas.forms.total_tested;
 
-    const workingCTAs = results.ctas.phone.working + results.ctas.email.working + results.ctas.forms.working;
+    const totalWorking =
+      results.ctas.phone.working + results.ctas.email.working + results.ctas.forms.working;
 
-    const brokenCTAs = results.ctas.phone.broken + results.ctas.email.broken + results.ctas.forms.broken;
+    const totalBroken =
+      results.ctas.phone.broken + results.ctas.email.broken + results.ctas.forms.broken;
 
-    // Phone issues
-    if (results.ctas.phone.broken > 0) {
-      if (results.ctas.phone.broken === results.ctas.phone.total_tested && results.ctas.phone.total_tested > 0) {
-        results.issues.push(`❌ CRITICAL: All phone links not tracking (0/${results.ctas.phone.total_tested})`);
-      } else if (results.ctas.phone.total_tested > 0) {
-        results.issues.push(`⚠️ ${results.ctas.phone.broken}/${results.ctas.phone.total_tested} phone links not tracking`);
-      }
+    // Tracking status
+    const trackingOk = results.tracking.gtm_loaded || results.tracking.ga4_collect_seen;
+
+    // Issues
+    if (results.tracking.gtm_found && !results.tracking.gtm_loaded) {
+      results.issues.push('⚠️ GTM found but no evidence it loaded (no gtm.js + no window object)');
+    }
+    if (results.tracking.ga4_found && !results.tracking.ga4_collect_seen) {
+      results.issues.push('⚠️ GA4 found but no GA4 collect beacons were seen');
     }
 
-    // Email issues
-    if (results.ctas.email.broken > 0) {
-      if (results.ctas.email.broken === results.ctas.email.total_tested && results.ctas.email.total_tested > 0) {
-        results.issues.push(`❌ CRITICAL: All email links not tracking (0/${results.ctas.email.total_tested})`);
-      } else if (results.ctas.email.total_tested > 0) {
-        results.issues.push(`⚠️ ${results.ctas.email.broken}/${results.ctas.email.total_tested} email links not tracking`);
-      }
+    if (totalTested > 0) {
+      results.summary = `${totalWorking}/${totalTested} CTA tests fired relevant GA4 events`;
+    } else {
+      results.summary = 'No CTAs tested (none found or page blocked)';
     }
 
-    // Form issues
-    if (results.ctas.forms.broken > 0) {
-      if (results.ctas.forms.broken === results.ctas.forms.total_tested && results.ctas.forms.total_tested > 0) {
-        results.issues.push(`❌ CRITICAL: All forms not tracking (0/${results.ctas.forms.total_tested})`);
-      } else if (results.ctas.forms.total_tested > 0) {
-        results.issues.push(`⚠️ ${results.ctas.forms.broken}/${results.ctas.forms.total_tested} forms not tracking`);
-      }
-    }
+    // Overall status rules:
+    // FAILING: no tracking at all, or critical issues
+    // WARNING: tracking exists but CTA failures exist
+    // HEALTHY: tracking exists + no CTA failures (or no CTAs found)
+    const criticalCount = results.issues.filter(x => x.includes('CRITICAL')).length;
 
-    // Tracking issues (found vs working)
-    if (results.tracking.gtm_found && !results.tracking.gtm_working) {
-      results.issues.push('⚠️ GTM found but no strong evidence it loaded/fired (no gtm.js + no window.google_tag_manager)');
-    }
-    if (results.tracking.ga4_found && !results.tracking.ga4_working) {
-      results.issues.push('⚠️ GA4 found but no strong evidence it fired (no GA4 collect beacons + no window.gtag)');
-    }
-
-    const criticalIssues = results.issues.filter(i => i.includes('CRITICAL')).length;
-
-    if (criticalIssues > 0 || (!results.tracking.gtm_found && !results.tracking.ga4_found)) {
+    if (criticalCount > 0 || !trackingOk) {
       results.overall_status = 'FAILING';
-    } else if (brokenCTAs > 0 || results.issues.length > 0) {
+    } else if (totalBroken > 0) {
       results.overall_status = 'WARNING';
     } else {
       results.overall_status = 'HEALTHY';
     }
 
-    results.summary = totalCTAs > 0 ? `${workingCTAs}/${totalCTAs} CTAs tracking correctly` : 'No CTAs found to test';
-  } catch (error) {
-    console.log(`\n❌ Fatal error: ${error.message}`);
-    results.issues.push(`Fatal error: ${error.message}`);
+    // Refresh evidence totals at end
+    await collectTrackingEvidence();
+
+  } catch (e) {
     results.overall_status = 'ERROR';
+    results.issues.push(`Fatal error: ${e.message}`);
+    try {
+      await collectTrackingEvidence();
+    } catch {}
   } finally {
     await browser.close().catch(() => {});
   }
-
-  // ============================================================
-  // FINAL SUMMARY
-  // ============================================================
-  console.log(`\n${'='.repeat(60)}`);
-  console.log(`✅ Health check complete: ${url}`);
-  console.log(`${'='.repeat(60)}`);
-  console.log(`\n📊 SUMMARY:`);
-  console.log(`   Status: ${results.overall_status}`);
-  console.log(`   ${results.summary}`);
-  console.log(`\n🏷️  TRACKING:`);
-  console.log(`   GTM: ${results.tracking.gtm_found ? '✅ Found' : '❌ Not found'} | Working: ${results.tracking.gtm_working ? '✅' : '❌'}`);
-  console.log(`   GA4: ${results.tracking.ga4_found ? '✅ Found' : '❌ Not found'} | Working: ${results.tracking.ga4_working ? '✅' : '❌'}`);
-  console.log(`\n🎯 CTAS:`);
-  console.log(`   📞 Phone: ${results.ctas.phone.working}/${results.ctas.phone.total_tested} working`);
-  console.log(`   📧 Email: ${results.ctas.email.working}/${results.ctas.email.total_tested} working`);
-  console.log(`   📝 Forms: ${results.ctas.forms.working}/${results.ctas.forms.total_tested} working`);
-
-  if (results.issues.length > 0) {
-    console.log(`\n⚠️  ISSUES:`);
-    results.issues.forEach((issue, index) => {
-      console.log(`   ${index + 1}. ${issue}`);
-    });
-  } else {
-    console.log(`\n✅ No issues - all tracking working!`);
-  }
-
-  console.log('='.repeat(60) + '\n');
 
   return results;
 }
