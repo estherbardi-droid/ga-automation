@@ -1,15 +1,15 @@
 // health.runners.js
-// VERSION: 2026-02-04T17:00:00Z - CLEAN BUILD FROM SIMPLE VERSION
-// - Deduplicates CTAs (tests each unique phone/email/form once)
-// - Tests homepage + all contact pages
-// - Skips external domain forms
-// - Proper success/fail logic (action events only, not page_view/scroll)
-// - Forms need completion event (not just form_start)
-// - No GTM/GA4 = automatic fail
+// VERSION: 2026-02-04T17:30:00Z
+// MAJOR UPDATE: Polling for events + test-until-success logic
+// - Polls for GA4 events (checks every 500ms up to 5 seconds)
+// - Tests all duplicate CTAs until one succeeds
+// - Skips forms with 0 visible fields
+// - Handles navigation without hanging
+// - Better event matching
 
 const { chromium } = require('playwright');
 
-const SCRIPT_VERSION = '2026-02-04T17:00:00Z';
+const SCRIPT_VERSION = '2026-02-04T17:30:00Z';
 
 // Helper to log with timestamp
 function log(message, data = null) {
@@ -21,7 +21,7 @@ function log(message, data = null) {
   }
 }
 
-// Normalize phone/email for deduplication
+// Normalize phone/email for grouping (not strict deduplication anymore)
 function normalizePhone(href) {
   if (!href) return null;
   const raw = href.replace(/^tel:/i, '');
@@ -48,18 +48,21 @@ const GENERIC_EVENTS = ['page_view', 'scroll', 'user_engagement', 'session_start
 
 const PHONE_ACTION_EVENTS = [
   'click_call', 'call_click', 'phone_click', 'click_phone', 
-  'click_tel', 'tel_click', 'phone', 'call', 'link_click'
+  'click_tel', 'tel_click', 'phone', 'call', 'link_click',
+  'tel_link', 'phone_link', 'call_button', 'phone_button'
 ];
 
 const EMAIL_ACTION_EVENTS = [
   'click_email', 'email_click', 'mailto_click', 'click_mail',
-  'mail_click', 'email', 'mailto', 'link_click'
+  'mail_click', 'email', 'mailto', 'link_click', 'email_link',
+  'mail_link', 'email_button'
 ];
 
 const FORM_COMPLETION_EVENTS = [
   'form_submit', 'submit_form', 'form_submission', 'contact_form',
   'generate_lead', 'lead', 'form_complete', 'form_success',
-  'contact', 'enquiry', 'quote', 'submit'
+  'contact', 'enquiry', 'quote', 'submit', 'form_sent',
+  'message_sent', 'inquiry_sent'
 ];
 
 function isActionEvent(eventName, actionEvents) {
@@ -73,7 +76,7 @@ function isFormCompletionEvent(eventName) {
   if (!eventName) return false;
   const evt = eventName.toLowerCase();
   if (GENERIC_EVENTS.includes(evt)) return false;
-  if (evt === 'form_start') return false; // form_start alone is NOT success
+  if (evt === 'form_start') return false;
   return FORM_COMPLETION_EVENTS.some(pattern => evt.includes(pattern.toLowerCase()));
 }
 
@@ -158,6 +161,7 @@ async function trackingHealthCheckSite(url) {
       networkBeacons.push({
         url: reqUrl,
         timestamp: new Date().toISOString(),
+        timestampMs: Date.now(),
         type: reqUrl.includes('gtm.js') ? 'GTM' : reqUrl.includes('/g/collect') ? 'GA4' : 'Other',
         event_name: eventName,
         measurement_id: measurementId
@@ -165,8 +169,15 @@ async function trackingHealthCheckSite(url) {
     }
   });
 
-  // Tracking for tested CTAs
-  const testedCTAs = {
+  // Track which CTAs succeeded (to avoid testing more duplicates)
+  const successfulCTAs = {
+    phones: new Set(),
+    emails: new Set(),
+    forms: new Set()
+  };
+
+  // Track which CTAs we've tested (for reporting)
+  const attemptedCTAs = {
     phones: new Set(),
     emails: new Set(),
     forms: new Set()
@@ -193,7 +204,9 @@ async function trackingHealthCheckSite(url) {
       }
     }
 
-    await page.waitForTimeout(3000);
+    // Give GA4 time to fully initialize
+    await page.waitForTimeout(5000);
+    log('⏳ Waited 5s for GA4 initialization');
 
     // Scan for tags
     const tagData = await page.evaluate(() => {
@@ -278,7 +291,8 @@ async function trackingHealthCheckSite(url) {
               log(`✅ Found consent button: ${selector}`);
               await btn.click({ timeout: 3000 }).catch(() => {});
               clicked = true;
-              await page.waitForTimeout(2000);
+              await page.waitForTimeout(3000); // Wait for tags to reinitialize
+              log('✅ Consent accepted, waited 3s for tags to reload');
               break;
             }
           }
@@ -286,9 +300,7 @@ async function trackingHealthCheckSite(url) {
       }
 
       results.cookie_consent.accepted = clicked;
-      if (clicked) {
-        log('✅ Consent accepted');
-      } else {
+      if (!clicked) {
         log('ℹ️ No consent banner found');
       }
     } catch (e) {
@@ -301,17 +313,35 @@ async function trackingHealthCheckSite(url) {
     // ============================================================
     log('\n🎯 PHASE 3: Testing CTAs across pages...');
 
-    async function getDataLayerEvents() {
-      return await page.evaluate(() => {
-        if (window.dataLayer) {
-          return window.dataLayer.map((item, index) => ({
-            index,
-            event: item.event || 'unknown',
-            data: item
-          }));
+    // Helper: Poll for events with specific criteria
+    async function pollForEvent(beforeBeaconCount, checkFn, maxWaitMs = 5000, label = 'event') {
+      const startPoll = Date.now();
+      const pollInterval = 500; // Check every 500ms
+      
+      log(`   ⏳ Polling for ${label} (up to ${maxWaitMs/1000}s)...`);
+
+      while (Date.now() - startPoll < maxWaitMs) {
+        const newBeacons = networkBeacons.slice(beforeBeaconCount);
+        const ga4Events = newBeacons
+          .filter(b => b.event_name)
+          .map(b => b.event_name);
+
+        if (checkFn(ga4Events)) {
+          const elapsed = ((Date.now() - startPoll) / 1000).toFixed(1);
+          log(`   ✅ Event found after ${elapsed}s`);
+          return { success: true, events: ga4Events };
         }
-        return [];
-      });
+
+        await page.waitForTimeout(pollInterval);
+      }
+
+      const finalBeacons = networkBeacons.slice(beforeBeaconCount);
+      const finalEvents = finalBeacons
+        .filter(b => b.event_name)
+        .map(b => b.event_name);
+
+      log(`   ⏱️ Timeout - no matching event found`);
+      return { success: false, events: finalEvents };
     }
 
     async function testCTAsOnPage(pageLabel) {
@@ -334,50 +364,88 @@ async function trackingHealthCheckSite(url) {
         if (foundCount > 0) {
           log(`   Found ${foundCount} phone link(s)`);
 
+          // Group by normalized number
+          const phoneGroups = new Map();
           for (let i = 0; i < phoneLinks.length; i++) {
             const link = phoneLinks[i];
             const href = await link.getAttribute('href').catch(() => null);
             if (!href) continue;
 
             const phoneKey = normalizePhone(href);
-            if (testedCTAs.phones.has(phoneKey)) {
-              log(`   ↩️ Skipping duplicate: ${href}`);
+            if (!phoneGroups.has(phoneKey)) {
+              phoneGroups.set(phoneKey, []);
+            }
+            phoneGroups.get(phoneKey).push({ link, href, index: i });
+          }
+
+          // Test each group until we find success
+          for (const [phoneKey, instances] of phoneGroups) {
+            // Skip if already succeeded
+            if (successfulCTAs.phones.has(phoneKey)) {
+              log(`   ✅ Already found working instance of ${phoneKey}, skipping`);
               continue;
             }
-            testedCTAs.phones.add(phoneKey);
 
-            log(`   Testing: ${href}`);
+            log(`   Testing phone number: ${phoneKey} (${instances.length} instances)`);
 
-            const beforeBeacons = networkBeacons.length;
-            await link.scrollIntoViewIfNeeded().catch(() => {});
-            await page.waitForTimeout(500);
-            await link.click({ force: true }).catch(() => {});
-            await page.waitForTimeout(2000);
+            let foundWorking = false;
+            for (const { link, href } of instances) {
+              if (foundWorking) {
+                log(`      ↩️ Skipping duplicate (already found working): ${href}`);
+                continue;
+              }
 
-            const newBeacons = networkBeacons.slice(beforeBeacons);
-            const ga4Events = newBeacons
-              .filter(b => b.event_name)
-              .map(b => b.event_name);
+              attemptedCTAs.phones.add(href);
+              log(`      Testing: ${href}`);
 
-            const actionEvents = ga4Events.filter(e => isActionEvent(e, PHONE_ACTION_EVENTS));
+              const beforeBeacons = networkBeacons.length;
+              
+              try {
+                await link.scrollIntoViewIfNeeded().catch(() => {});
+                await page.waitForTimeout(300);
+                await link.click({ force: true, timeout: 3000 }).catch(() => {});
+              } catch (clickError) {
+                log(`         ⚠️ Click failed: ${clickError.message}`);
+                continue;
+              }
 
-            results.cta_tests.phone_clicks.tested++;
+              // Poll for phone action events
+              const result = await pollForEvent(
+                beforeBeacons,
+                (events) => events.some(e => isActionEvent(e, PHONE_ACTION_EVENTS)),
+                5000,
+                'phone action event'
+              );
 
-            if (actionEvents.length > 0) {
-              log(`      ✅ SUCCESS - Events: ${actionEvents.join(', ')}`);
-              results.cta_tests.phone_clicks.events_fired.push({
-                link: href,
-                reason: 'Action event fired',
-                events: ga4Events
-              });
-            } else {
-              log(`      ❌ FAILED - No action events (saw: ${ga4Events.join(', ') || 'none'})`);
-              results.cta_tests.phone_clicks.failed.push({
-                link: href,
-                reason: ga4Events.length > 0 
-                  ? `Only generic events: ${ga4Events.join(', ')}`
-                  : 'No tracking fired'
-              });
+              results.cta_tests.phone_clicks.tested++;
+
+              if (result.success) {
+                const actionEvents = result.events.filter(e => isActionEvent(e, PHONE_ACTION_EVENTS));
+                log(`      ✅ SUCCESS - Events: ${actionEvents.join(', ')}`);
+                results.cta_tests.phone_clicks.events_fired.push({
+                  link: href,
+                  phone_number: phoneKey,
+                  reason: 'Action event fired',
+                  events: result.events,
+                  action_events: actionEvents
+                });
+                foundWorking = true;
+                successfulCTAs.phones.add(phoneKey);
+              } else {
+                log(`      ❌ No action events (saw: ${result.events.join(', ') || 'none'})`);
+                // Don't add to failed yet - might find working duplicate
+              }
+            }
+
+            // If none worked, mark all as failed
+            if (!foundWorking) {
+              for (const { href } of instances) {
+                results.cta_tests.phone_clicks.failed.push({
+                  link: href,
+                  phone_number: phoneKey,
+                  reason: 'No action events fired on any instance'
+                });
+              }
             }
           }
         } else {
@@ -397,52 +465,89 @@ async function trackingHealthCheckSite(url) {
         if (foundCount > 0) {
           log(`   Found ${foundCount} email link(s)`);
 
+          // Group by normalized email
+          const emailGroups = new Map();
           for (let i = 0; i < emailLinks.length; i++) {
             const link = emailLinks[i];
             const href = await link.getAttribute('href').catch(() => null);
             if (!href) continue;
 
             const emailKey = normalizeEmail(href);
-            if (testedCTAs.emails.has(emailKey)) {
-              log(`   ↩️ Skipping duplicate: ${href}`);
+            if (!emailGroups.has(emailKey)) {
+              emailGroups.set(emailKey, []);
+            }
+            emailGroups.get(emailKey).push({ link, href, index: i });
+          }
+
+          // Test each group until we find success
+          for (const [emailKey, instances] of emailGroups) {
+            // Skip if already succeeded
+            if (successfulCTAs.emails.has(emailKey)) {
+              log(`   ✅ Already found working instance of ${emailKey}, skipping`);
               continue;
             }
-            testedCTAs.emails.add(emailKey);
 
-            log(`   Testing: ${href}`);
+            log(`   Testing email: ${emailKey} (${instances.length} instances)`);
 
-            const beforeBeacons = networkBeacons.length;
-            await link.scrollIntoViewIfNeeded().catch(() => {});
-            await page.waitForTimeout(500);
-            await link.hover().catch(() => {});
-            await page.waitForTimeout(300);
-            await link.click({ force: true }).catch(() => {});
-            await page.waitForTimeout(2500);
+            let foundWorking = false;
+            for (const { link, href } of instances) {
+              if (foundWorking) {
+                log(`      ↩️ Skipping duplicate (already found working): ${href}`);
+                continue;
+              }
 
-            const newBeacons = networkBeacons.slice(beforeBeacons);
-            const ga4Events = newBeacons
-              .filter(b => b.event_name)
-              .map(b => b.event_name);
+              attemptedCTAs.emails.add(href);
+              log(`      Testing: ${href}`);
 
-            const actionEvents = ga4Events.filter(e => isActionEvent(e, EMAIL_ACTION_EVENTS));
+              const beforeBeacons = networkBeacons.length;
+              
+              try {
+                await link.scrollIntoViewIfNeeded().catch(() => {});
+                await page.waitForTimeout(300);
+                await link.hover().catch(() => {});
+                await page.waitForTimeout(200);
+                await link.click({ force: true, timeout: 3000 }).catch(() => {});
+              } catch (clickError) {
+                log(`         ⚠️ Click failed: ${clickError.message}`);
+                continue;
+              }
 
-            results.cta_tests.email_clicks.tested++;
+              // Poll for email action events
+              const result = await pollForEvent(
+                beforeBeacons,
+                (events) => events.some(e => isActionEvent(e, EMAIL_ACTION_EVENTS)),
+                5000,
+                'email action event'
+              );
 
-            if (actionEvents.length > 0) {
-              log(`      ✅ SUCCESS - Events: ${actionEvents.join(', ')}`);
-              results.cta_tests.email_clicks.events_fired.push({
-                link: href,
-                reason: 'Action event fired',
-                events: ga4Events
-              });
-            } else {
-              log(`      ❌ FAILED - No action events (saw: ${ga4Events.join(', ') || 'none'})`);
-              results.cta_tests.email_clicks.failed.push({
-                link: href,
-                reason: ga4Events.length > 0
-                  ? `Only generic events: ${ga4Events.join(', ')}`
-                  : 'No tracking fired'
-              });
+              results.cta_tests.email_clicks.tested++;
+
+              if (result.success) {
+                const actionEvents = result.events.filter(e => isActionEvent(e, EMAIL_ACTION_EVENTS));
+                log(`      ✅ SUCCESS - Events: ${actionEvents.join(', ')}`);
+                results.cta_tests.email_clicks.events_fired.push({
+                  link: href,
+                  email: emailKey,
+                  reason: 'Action event fired',
+                  events: result.events,
+                  action_events: actionEvents
+                });
+                foundWorking = true;
+                successfulCTAs.emails.add(emailKey);
+              } else {
+                log(`      ❌ No action events (saw: ${result.events.join(', ') || 'none'})`);
+              }
+            }
+
+            // If none worked, mark all as failed
+            if (!foundWorking) {
+              for (const { href } of instances) {
+                results.cta_tests.email_clicks.failed.push({
+                  link: href,
+                  email: emailKey,
+                  reason: 'No action events fired on any instance'
+                });
+              }
             }
           }
         } else {
@@ -472,33 +577,21 @@ async function trackingHealthCheckSite(url) {
               continue;
             }
 
-            // Create form signature for deduplication
-            try {
-              const formId = await form.getAttribute('id').catch(() => null);
-              const formAction = await form.getAttribute('action').catch(() => null);
-              const firstInput = await form.$('input, textarea').catch(() => null);
-              const firstInputName = firstInput 
-                ? await firstInput.getAttribute('name').catch(() => null)
-                : null;
+            // Check visible fields FIRST
+            const visibleInputs = await form.$$('input:visible:not([type="hidden"]), textarea:visible, select:visible').catch(() => []);
+            
+            if (visibleInputs.length === 0) {
+              log(`   ⏭️ Skipping form ${i + 1} (no visible fields)`);
+              continue;
+            }
 
-              const formKey = `${formUrl}|${formId}|${formAction}|${firstInputName}`;
-              
-              if (testedCTAs.forms.has(formKey)) {
-                log(`   ↩️ Skipping duplicate form`);
-                continue;
-              }
-              testedCTAs.forms.add(formKey);
-            } catch {}
-
-            log(`   Testing form ${i + 1}...`);
+            log(`   Testing form ${i + 1} (${visibleInputs.length} visible fields)...`);
 
             const beforeBeacons = networkBeacons.length;
 
             // Fill form
-            const inputs = await form.$$('input, textarea, select').catch(() => []);
             let filledCount = 0;
-
-            for (const input of inputs.slice(0, 10)) {
+            for (const input of visibleInputs.slice(0, 10)) {
               try {
                 const inputType = await input.getAttribute('type').catch(() => '');
                 const inputName = await input.getAttribute('name').catch(() => '');
@@ -518,7 +611,7 @@ async function trackingHealthCheckSite(url) {
                   await input.fill('Test User').catch(() => {});
                   filledCount++;
                 }
-                await page.waitForTimeout(200);
+                await page.waitForTimeout(150);
               } catch {}
             }
 
@@ -529,31 +622,42 @@ async function trackingHealthCheckSite(url) {
 
             if (submitBtn) {
               log('      👆 Clicking submit...');
-              await submitBtn.click().catch(() => {});
-              await page.waitForTimeout(3000);
+              
+              try {
+                // Click without waiting for navigation
+                await Promise.race([
+                  submitBtn.click({ timeout: 3000 }),
+                  page.waitForTimeout(3500)
+                ]).catch(() => {});
+              } catch (clickError) {
+                log(`         ⚠️ Submit click issue: ${clickError.message}`);
+              }
 
-              const newBeacons = networkBeacons.slice(beforeBeacons);
-              const ga4Events = newBeacons
-                .filter(b => b.event_name)
-                .map(b => b.event_name);
-
-              const completionEvents = ga4Events.filter(e => isFormCompletionEvent(e));
+              // Poll for form completion events
+              const result = await pollForEvent(
+                beforeBeacons,
+                (events) => events.some(e => isFormCompletionEvent(e)),
+                6000, // Forms can be slower
+                'form completion event'
+              );
 
               results.cta_tests.forms.tested++;
 
-              if (completionEvents.length > 0) {
+              if (result.success) {
+                const completionEvents = result.events.filter(e => isFormCompletionEvent(e));
                 log(`      ✅ SUCCESS - Completion events: ${completionEvents.join(', ')}`);
                 results.cta_tests.forms.events_fired.push({
                   form_index: i + 1,
                   reason: 'Form completion event fired',
-                  events: ga4Events
+                  events: result.events,
+                  completion_events: completionEvents
                 });
               } else {
-                const hasFormStart = ga4Events.some(e => e.toLowerCase() === 'form_start');
+                const hasFormStart = result.events.some(e => e.toLowerCase() === 'form_start');
                 const reason = hasFormStart
                   ? 'Only form_start (no completion event)'
-                  : ga4Events.length > 0
-                  ? `No completion events (saw: ${ga4Events.join(', ')})`
+                  : result.events.length > 0
+                  ? `No completion events (saw: ${result.events.join(', ')})`
                   : 'No tracking fired';
 
                 log(`      ❌ FAILED - ${reason}`);
@@ -652,9 +756,9 @@ async function trackingHealthCheckSite(url) {
   log(`   Runtime: ${runtime}s`);
   log(`   Critical errors: ${results.critical_errors.length}`);
   log(`   Issues: ${results.issues.length}`);
-  log(`   Phone: ${results.cta_tests.phone_clicks.tested} tested (${results.cta_tests.phone_clicks.events_fired.length} working)`);
-  log(`   Email: ${results.cta_tests.email_clicks.tested} tested (${results.cta_tests.email_clicks.events_fired.length} working)`);
-  log(`   Forms: ${results.cta_tests.forms.tested} tested (${results.cta_tests.forms.events_fired.length} working)`);
+  log(`   Phone: ${results.cta_tests.phone_clicks.events_fired.length} working / ${results.cta_tests.phone_clicks.tested} tested`);
+  log(`   Email: ${results.cta_tests.email_clicks.events_fired.length} working / ${results.cta_tests.email_clicks.tested} tested`);
+  log(`   Forms: ${results.cta_tests.forms.events_fired.length} working / ${results.cta_tests.forms.tested} tested`);
   log('='.repeat(60));
 
   return results;
