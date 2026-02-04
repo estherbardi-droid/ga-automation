@@ -1086,5 +1086,5 @@ async function runHealthCheck(input) {
 }
 
 module.exports = {
-  trackingHealthCheckSite
+  trackingHealthCheckSite: runHealthCheck  // Map the export name to the actual function
 };
