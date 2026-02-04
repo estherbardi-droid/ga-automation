@@ -11,6 +11,8 @@
 const { chromium } = require('playwright');
 
 const SCRIPT_VERSION = '2026-02-04T18:55:00Z';
+console.log('✅ Loaded health.runners.js', SCRIPT_VERSION);
+
 
 // -------------------- Logging --------------------
 function log(message, data = null) {
