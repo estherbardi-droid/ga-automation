@@ -1085,4 +1085,6 @@ async function runHealthCheck(input) {
   }
 }
 
-module.exports = { runHealthCheck, SCRIPT_VERSION };
+module.exports = {
+  trackingHealthCheckSite
+};
