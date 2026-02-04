@@ -1,30 +1,28 @@
 // health.runners.js
 // GOLD VERSION (UPDATED): stabilise waits + provider-aware form detection + looser form-like matching + broader modal probing
-// - Detects GTM/GA4 via DOM + network evidence
-// - Accepts cookie banners (incl iframes)
-// - Finds CTAs (tel/mailto) + finds forms in main DOM + iframes + "form-like" containers
-// - Tests CTAs on homepage + each contact-like page (not just last visited)
-// - Probes likely contact buttons to open modals, then rescans forms
-// - Captures GA4 events from GET + POST /g/collect and records relevant events
-// - Safer form fill (no real PII), best-effort submit click, and records why submit didn't happen
-//
-// FIXES:
-// 1) stabilise(page): waits for networkidle + extra settle time after goto/probe (late-loaded forms)
-// 2) findVisibleFormsEverywhere():
-//    - detects common WP builders (Elementor / CF7 / WPForms / Gravity / Fluent / Ninja)
-//    - less strict form-like detection (no exact button text requirement)
-//    - embedded iframe fallback (Typeform/Jotform/HubSpot/Wufoo/Formstack/Google Forms etc.)
-//    - finds ALL forms, not just first match
-//    - doesn't skip forms just because they're hidden
-// 3) probeForContactModal(): broader selectors (aria-label, data-open, #contact anchors, "Request", etc.)
-// 4) testForms(): submit selector broadened (Continue/Next/Get Started/Request Callback etc.) + aria-label submit
+// ENHANCED WITH COMPREHENSIVE LOGGING FOR DEBUGGING
+
+// VERSION IDENTIFIER - Update this timestamp each time you push to GitHub
+const SCRIPT_VERSION = '2026-02-04T15:30:00Z'; // CHANGE THIS EACH TIME YOU UPDATE!
 
 const { chromium } = require('playwright');
 
+// Helper to log with timestamp
+function logWithTime(message, data = null) {
+  const timestamp = new Date().toISOString();
+  if (data) {
+    console.log(`[${timestamp}] ${message}`, JSON.stringify(data, null, 2));
+  } else {
+    console.log(`[${timestamp}] ${message}`);
+  }
+}
+
 function normaliseUrl(input) {
+  logWithTime(`🔧 Normalizing URL: ${input}`);
   if (!input) return null;
   let u = input.trim();
   if (!/^https?:\/\//i.test(u)) u = `https://${u}`;
+  logWithTime(`✅ Normalized to: ${u}`);
   return u;
 }
 
@@ -51,6 +49,7 @@ function isSameOrigin(a, b) {
 
 async function scrollToFooter(page) {
   try {
+    logWithTime('📜 Scrolling to footer...');
     await page.evaluate(async () => {
       const sleep = ms => new Promise(r => setTimeout(r, ms));
       const max = Math.max(document.body.scrollHeight, document.documentElement.scrollHeight);
@@ -61,29 +60,36 @@ async function scrollToFooter(page) {
       }
       window.scrollTo(0, max);
     });
-  } catch {}
+    logWithTime('✅ Scrolled to footer');
+  } catch (e) {
+    logWithTime('⚠️ Error scrolling to footer', { error: e.message });
+  }
 }
 
 async function stabilise(page) {
-  // Give SPA/widget forms time to render, and let async scripts settle.
+  logWithTime('⏳ Stabilizing page (waiting for content to load)...');
   await page.waitForLoadState('domcontentloaded').catch(() => {});
   await page.waitForLoadState('networkidle', { timeout: 8000 }).catch(() => {});
-  await page.waitForTimeout(2000); // Increased from 1500ms
+  await page.waitForTimeout(2000);
+  logWithTime('✅ Page stabilized');
 }
 
 async function robustClick(locator, page, labelForLogs = '') {
-  // Goal: trigger site click handlers (GTM listeners), not OS handlers.
-  // Return: { ok: boolean, reason?: string }
+  logWithTime(`🖱️ Attempting click: ${labelForLogs}`);
   try {
     await locator.scrollIntoViewIfNeeded().catch(() => {});
     await page.waitForTimeout(150);
 
     const visible = await locator.isVisible().catch(() => false);
-    if (!visible) return { ok: false, reason: 'Not visible' };
+    if (!visible) {
+      logWithTime(`❌ Click failed - not visible: ${labelForLogs}`);
+      return { ok: false, reason: 'Not visible' };
+    }
 
     await locator.click({ trial: true, timeout: 2000 }).catch(() => {});
 
     await locator.click({ timeout: 3000 }).catch(async () => {
+      logWithTime(`⚠️ Normal click failed, trying JS dispatch: ${labelForLogs}`);
       await locator
         .evaluate(el => {
           const ev = new MouseEvent('click', { bubbles: true, cancelable: true, view: window });
@@ -93,13 +99,16 @@ async function robustClick(locator, page, labelForLogs = '') {
     });
 
     await page.waitForTimeout(600);
+    logWithTime(`✅ Click successful: ${labelForLogs}`);
     return { ok: true };
   } catch (e) {
+    logWithTime(`❌ Click error: ${labelForLogs}`, { error: e.message });
     return { ok: false, reason: `${labelForLogs} ${e.message}`.trim() };
   }
 }
 
 async function clickConsentEverywhere(page) {
+  logWithTime('🍪 Checking for cookie consent banners...');
   const selectors = [
     '#onetrust-accept-btn-handler',
     'button:has-text("Accept")',
@@ -125,6 +134,8 @@ async function clickConsentEverywhere(page) {
   let clicked = false;
 
   const frames = page.frames();
+  logWithTime(`🔍 Checking ${frames.length} frames for consent buttons...`);
+  
   for (const frame of frames) {
     for (const sel of selectors) {
       try {
@@ -135,6 +146,7 @@ async function clickConsentEverywhere(page) {
         const vis = await loc.isVisible().catch(() => false);
         if (!vis) continue;
 
+        logWithTime(`✅ Found consent button: ${sel}`);
         await loc.click({ timeout: 3000 }).catch(async () => {
           await loc.click({ force: true, timeout: 3000 }).catch(() => {});
         });
@@ -145,6 +157,11 @@ async function clickConsentEverywhere(page) {
     }
   }
 
+  if (clicked) {
+    logWithTime('✅ Clicked consent banner');
+  } else {
+    logWithTime('ℹ️ No consent banner found');
+  }
   return clicked;
 }
 
@@ -242,11 +259,17 @@ const FORM_EVENT_PATTERNS = [
 const IGNORE_EXACT_EVENTS = ['page_view', 'scroll', 'user_engagement', 'session_start', 'first_visit'];
 
 async function trackingHealthCheckSite(inputUrl) {
+  logWithTime('🚀 STARTING TRACKING HEALTH CHECK');
+  logWithTime('📌 SCRIPT VERSION: ' + SCRIPT_VERSION);
+  logWithTime('📋 Input URL', { url: inputUrl });
+  
+  logWithTime('🌐 Launching browser...');
   const browser = await chromium.launch({
     headless: true,
     timeout: 90000,
     args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu']
   });
+  logWithTime('✅ Browser launched');
 
   const context = await browser.newContext({
     userAgent:
@@ -254,6 +277,7 @@ async function trackingHealthCheckSite(inputUrl) {
   });
 
   const page = await context.newPage();
+  logWithTime('✅ New page created');
 
   const startedAt = Date.now();
   const MAX_RUNTIME = 10 * 60 * 1000;
@@ -274,7 +298,10 @@ async function trackingHealthCheckSite(inputUrl) {
       method: request.method()
     };
 
-    if (looksLikeGTM(reqUrl)) entry.type = 'GTM';
+    if (looksLikeGTM(reqUrl)) {
+      entry.type = 'GTM';
+      logWithTime('📊 GTM request detected', { url: reqUrl });
+    }
 
     if (looksLikeGA4Collect(reqUrl)) {
       entry.type = 'GA4';
@@ -289,6 +316,11 @@ async function trackingHealthCheckSite(inputUrl) {
         entry.event_name = fromPost.en || entry.event_name;
         entry.measurement_id = fromPost.tid || entry.measurement_id;
       }
+      
+      logWithTime('📊 GA4 event captured', { 
+        event: entry.event_name, 
+        measurement_id: entry.measurement_id 
+      });
     }
 
     allBeacons.push(entry);
@@ -333,6 +365,7 @@ async function trackingHealthCheckSite(inputUrl) {
   }
 
   async function gotoWithHttpsFallback(url) {
+    logWithTime('🌐 Navigating to page', { url });
     const u0 = normaliseUrl(url);
     const uHttps = toHttpsFirst(u0);
 
@@ -343,19 +376,25 @@ async function trackingHealthCheckSite(inputUrl) {
 
     for (const u of attempts) {
       try {
+        logWithTime(`⏳ Trying: ${u}`);
         const resp = await page.goto(u, { waitUntil: 'domcontentloaded', timeout: 45000 });
         results.final_url = page.url();
+        logWithTime('✅ Page loaded successfully', { final_url: results.final_url });
         await stabilise(page);
         return resp;
       } catch (e) {
         lastErr = e;
+        logWithTime(`⚠️ First attempt failed: ${e.message}`);
         try {
+          logWithTime('🔄 Trying with commit wait state...');
           const resp2 = await page.goto(u, { waitUntil: 'commit', timeout: 30000 });
           results.final_url = page.url();
+          logWithTime('✅ Page loaded with commit', { final_url: results.final_url });
           await stabilise(page);
           return resp2;
         } catch (e2) {
           lastErr = e2;
+          logWithTime(`❌ Second attempt failed: ${e2.message}`);
         }
       }
     }
@@ -364,6 +403,7 @@ async function trackingHealthCheckSite(inputUrl) {
   }
 
   async function detectTagsInDom() {
+    logWithTime('🔍 Detecting tracking tags in DOM...');
     return page.evaluate(() => {
       const tags = { gtm: [], ga4: [] };
 
@@ -393,6 +433,7 @@ async function trackingHealthCheckSite(inputUrl) {
   }
 
   async function collectTrackingEvidence() {
+    logWithTime('📊 Collecting tracking evidence...');
     const beacons = allBeacons;
     const sawGtm = beacons.some(b => b.type === 'GTM');
     const ga4 = beacons.filter(b => b.type === 'GA4');
@@ -407,6 +448,13 @@ async function trackingHealthCheckSite(inputUrl) {
 
     results.tracking.gtm_loaded = sawGtm;
     results.tracking.ga4_collect_seen = sawGa4;
+    
+    logWithTime('📊 Tracking evidence collected', {
+      total_beacons: beacons.length,
+      gtm: sawGtm,
+      ga4: sawGa4,
+      events: events
+    });
   }
 
   async function detectCaptchaOnPage() {
@@ -414,13 +462,18 @@ async function trackingHealthCheckSite(inputUrl) {
       const hasRecaptcha = await page.locator('iframe[src*="recaptcha"]').count().catch(() => 0);
       const hasHcaptcha = await page.locator('iframe[src*="hcaptcha"]').count().catch(() => 0);
       const hasTurnstile = await page.locator('iframe[src*="challenges.cloudflare.com"]').count().catch(() => 0);
-      return hasRecaptcha > 0 || hasHcaptcha > 0 || hasTurnstile > 0;
+      const detected = hasRecaptcha > 0 || hasHcaptcha > 0 || hasTurnstile > 0;
+      if (detected) {
+        logWithTime('🔒 CAPTCHA detected on page');
+      }
+      return detected;
     } catch {
       return false;
     }
   }
 
   async function tryFillForm(container) {
+    logWithTime('📝 Attempting to fill form fields...');
     const notes = [];
     let filled = 0;
 
@@ -428,6 +481,8 @@ async function trackingHealthCheckSite(inputUrl) {
     if (hasCaptcha) notes.push('captcha_detected');
 
     const fields = await container.locator('input:visible, textarea:visible, select:visible').all().catch(() => []);
+    logWithTime(`📝 Found ${fields.length} fillable fields`);
+    
     for (const field of fields.slice(0, 25)) {
       try {
         const tag = await field.evaluate(el => el.tagName.toLowerCase()).catch(() => '');
@@ -475,10 +530,10 @@ async function trackingHealthCheckSite(inputUrl) {
       } catch {}
     }
 
+    logWithTime(`✅ Filled ${filled} form fields`, { notes });
     return { filledFields: filled, notes };
   }
 
-  // UPDATED: provider-aware + less strict + embedded iframe fallback + better logging
   async function findVisibleFormsEverywhere(page, { maxVisible = 10 } = {}) {
     const found = [];
     const embeddedIframes = [];
@@ -492,7 +547,7 @@ async function trackingHealthCheckSite(inputUrl) {
       skipped_invisible: 0
     };
 
-    console.log(`🔍 Scanning ${page.url()} for forms...`);
+    logWithTime(`🔍 Scanning ${page.url()} for forms...`);
 
     const PROVIDER_IFRAME_SEL = `
       iframe[src*="typeform" i],
@@ -517,7 +572,6 @@ async function trackingHealthCheckSite(inputUrl) {
 
       const visible = await loc.isVisible().catch(() => false);
 
-      // Check for fields (visible or hidden - we'll handle visibility later)
       const allFields = await loc.locator('input:not([type="hidden"]), textarea, select').count().catch(() => 0);
       if (allFields === 0) {
         debug.skipped_no_fields++;
@@ -533,6 +587,8 @@ async function trackingHealthCheckSite(inputUrl) {
         debug.skipped_invisible++;
       }
 
+      logWithTime(`📋 Found ${kind} form`, { visible, fields: visibleFields, total_fields: allFields });
+
       found.push({
         kind,
         frameUrl: frame.url(),
@@ -546,7 +602,6 @@ async function trackingHealthCheckSite(inputUrl) {
     for (const frame of page.frames()) {
       if (found.length >= maxVisible) break;
 
-      // PASS 1: Standard <form> tags (most reliable) - find ALL, not just first
       const formTags = await frame.locator('form').all().catch(() => []);
       debug.form_tags_found += formTags.length;
 
@@ -557,7 +612,6 @@ async function trackingHealthCheckSite(inputUrl) {
         await pushIfTestable(frame, formLoc, 'form');
       }
 
-      // PASS 2: WordPress form builders (high hit rate) - find ALL
       const builders = [
         { kind: 'cf7', sel: '.wpcf7-form, .wpcf7' },
         { kind: 'elementor', sel: '.elementor-form, form.elementor-form' },
@@ -579,14 +633,12 @@ async function trackingHealthCheckSite(inputUrl) {
         }
       }
 
-      // PASS 3: [role="form"] - find ALL
       const roleForms = await frame.locator('[role="form"]').all().catch(() => []);
       for (const loc of roleForms) {
         if (found.length >= maxVisible) break;
         await pushIfTestable(frame, loc, 'role_form');
       }
 
-      // PASS 4: Containers with fields + button (form-like) - simplified
       const formLike = await frame
         .locator('section, div, article, main')
         .filter({ has: frame.locator('input:not([type="hidden"]), textarea, select') })
@@ -594,10 +646,8 @@ async function trackingHealthCheckSite(inputUrl) {
         .catch(() => []);
 
       for (const loc of formLike.slice(0, 5)) {
-        // Limit to avoid noise
         if (found.length >= maxVisible) break;
 
-        // Check if it has a button-like element
         const hasButton = await loc
           .locator('button, [type="submit"], [role="button"], a[class*="button" i], a[class*="btn" i]')
           .count()
@@ -610,7 +660,6 @@ async function trackingHealthCheckSite(inputUrl) {
       }
     }
 
-    // PASS 5: Embedded iframe forms (fallback evidence)
     try {
       const iframeLocs = await page.locator(PROVIDER_IFRAME_SEL).all().catch(() => []);
       for (const fr of iframeLocs.slice(0, 10)) {
@@ -623,14 +672,14 @@ async function trackingHealthCheckSite(inputUrl) {
       }
     } catch {}
 
-    console.log('Form detection summary:', debug);
-    console.log(`✅ Found ${found.length} testable forms, ${embeddedIframes.length} iframe forms`);
+    logWithTime('📊 Form detection summary', debug);
+    logWithTime(`✅ Found ${found.length} testable forms, ${embeddedIframes.length} iframe forms`);
 
     return { found, embeddedIframes, debug };
   }
 
-  // UPDATED: broader modal probing
   async function probeForContactModal(page, maxClicks = 3) {
+    logWithTime('🔍 Probing for contact modals...');
     const candidates = page.locator(
       [
         'a:has-text("Contact")',
@@ -663,6 +712,7 @@ async function trackingHealthCheckSite(inputUrl) {
 
     const count = await candidates.count().catch(() => 0);
     const limit = Math.min(count, maxClicks);
+    logWithTime(`📋 Found ${count} modal candidates, will try ${limit}`);
 
     let clicked = 0;
     for (let i = 0; i < limit; i++) {
@@ -675,39 +725,49 @@ async function trackingHealthCheckSite(inputUrl) {
         await stabilise(page);
       }
     }
+    logWithTime(`✅ Clicked ${clicked} modal buttons`);
     return clicked;
   }
 
   async function findCtas() {
+    logWithTime('🔍 Finding CTAs (phone, email, forms)...');
     await scrollToFooter(page);
 
     const phoneLocators = page.locator('a[href^="tel:"]');
     const emailLocators = page.locator('a[href^="mailto:"]');
 
-    // first scan
     let { found: visibleForms, embeddedIframes, debug } = await findVisibleFormsEverywhere(page, { maxVisible: 10 });
 
-    // if none found, try opening modals then rescan
     if (visibleForms.length === 0) {
-      console.log('⚠️  No forms found, trying modal probe...');
+      logWithTime('⚠️ No forms found, trying modal probe...');
       const clicked = await probeForContactModal(page, 3).catch(() => 0);
       results.debug.modal_probe_clicked += clicked;
 
       ({ found: visibleForms, embeddedIframes, debug } = await findVisibleFormsEverywhere(page, { maxVisible: 10 }));
     }
 
-    // record embed evidence (debug)
     if (embeddedIframes.length) {
+      logWithTime('📋 Found embedded iframe forms', { count: embeddedIframes.length });
       results.debug.embedded_forms.push({
         page: page.url(),
         iframes: embeddedIframes
       });
     }
 
+    const phoneCount = await phoneLocators.count().catch(() => 0);
+    const emailCount = await emailLocators.count().catch(() => 0);
+    
+    logWithTime('✅ CTA scan complete', {
+      phone_links: phoneCount,
+      email_links: emailCount,
+      forms: visibleForms.length,
+      embedded_forms: embeddedIframes.length
+    });
+
     return {
       phoneLocators,
       emailLocators,
-      visibleForms, // array of {kind, frameUrl, locator, visible, totalFields, visibleFields}
+      visibleForms,
       visibleFormCount: visibleForms.length,
       embeddedIframes
     };
@@ -716,6 +776,7 @@ async function trackingHealthCheckSite(inputUrl) {
   async function testPhoneLinks(phoneLocators, max = 10) {
     const count = await phoneLocators.count().catch(() => 0);
     results.ctas.phone.total_found += count;
+    logWithTime(`📞 Testing phone links (${count} found, max ${max})...`);
 
     const limit = Math.min(count, max);
     for (let i = 0; i < limit; i++) {
@@ -724,6 +785,8 @@ async function trackingHealthCheckSite(inputUrl) {
       const loc = phoneLocators.nth(i);
       const href = await loc.getAttribute('href').catch(() => null);
       const text = (await loc.textContent().catch(() => ''))?.trim() || '';
+
+      logWithTime(`📞 Testing phone link ${i + 1}/${limit}`, { href, text });
 
       const before = allBeacons.length;
       const t0 = Date.now();
@@ -737,6 +800,12 @@ async function trackingHealthCheckSite(inputUrl) {
       const newBeacons = beaconsBetween(before, t0, t1);
       const ga4Events = uniq(newBeacons.filter(b => b.type === 'GA4').map(b => b.event_name).filter(Boolean));
       const relevant = ga4Events.filter(ev => isRelevantEventName(ev, PHONE_EVENT_PATTERNS, IGNORE_EXACT_EVENTS));
+
+      logWithTime(`📊 Phone link result`, { 
+        clicked: clickRes.ok, 
+        events: ga4Events, 
+        relevant: relevant 
+      });
 
       if (!clickRes.ok) {
         if (relevant.length > 0) {
@@ -773,11 +842,14 @@ async function trackingHealthCheckSite(inputUrl) {
         });
       }
     }
+    
+    logWithTime(`✅ Phone links tested: ${results.ctas.phone.working} working, ${results.ctas.phone.broken} broken`);
   }
 
   async function testEmailLinks(emailLocators, max = 10) {
     const count = await emailLocators.count().catch(() => 0);
     results.ctas.email.total_found += count;
+    logWithTime(`📧 Testing email links (${count} found, max ${max})...`);
 
     const limit = Math.min(count, max);
     for (let i = 0; i < limit; i++) {
@@ -786,6 +858,8 @@ async function trackingHealthCheckSite(inputUrl) {
       const loc = emailLocators.nth(i);
       const href = await loc.getAttribute('href').catch(() => null);
       const text = (await loc.textContent().catch(() => ''))?.trim() || '';
+
+      logWithTime(`📧 Testing email link ${i + 1}/${limit}`, { href, text });
 
       const before = allBeacons.length;
       const t0 = Date.now();
@@ -799,6 +873,12 @@ async function trackingHealthCheckSite(inputUrl) {
       const newBeacons = beaconsBetween(before, t0, t1);
       const ga4Events = uniq(newBeacons.filter(b => b.type === 'GA4').map(b => b.event_name).filter(Boolean));
       const relevant = ga4Events.filter(ev => isRelevantEventName(ev, EMAIL_EVENT_PATTERNS, IGNORE_EXACT_EVENTS));
+
+      logWithTime(`📊 Email link result`, { 
+        clicked: clickRes.ok, 
+        events: ga4Events, 
+        relevant: relevant 
+      });
 
       if (!clickRes.ok) {
         if (relevant.length > 0) {
@@ -835,10 +915,13 @@ async function trackingHealthCheckSite(inputUrl) {
         });
       }
     }
+    
+    logWithTime(`✅ Email links tested: ${results.ctas.email.working} working, ${results.ctas.email.broken} broken`);
   }
 
   async function testForms(visibleForms, max = 3) {
     results.ctas.forms.total_found += visibleForms.length;
+    logWithTime(`📝 Testing forms (${visibleForms.length} found, max ${max})...`);
 
     const limit = Math.min(visibleForms.length, max);
     for (let i = 0; i < limit; i++) {
@@ -847,19 +930,19 @@ async function trackingHealthCheckSite(inputUrl) {
       const item = visibleForms[i];
       const container = item.locator;
 
-      console.log(
-        `Testing form ${i + 1}/${limit}: ${item.kind} (visible: ${item.visible}, fields: ${item.visibleFields}/${item.totalFields})`
+      logWithTime(
+        `📝 Testing form ${i + 1}/${limit}`,
+        { kind: item.kind, visible: item.visible, fields: `${item.visibleFields}/${item.totalFields}` }
       );
 
-      // If form is not visible, try to make it visible
       if (!item.visible) {
-        console.log('  Form not visible, attempting to reveal...');
+        logWithTime('⚠️ Form not visible, attempting to reveal...');
         await container.scrollIntoViewIfNeeded().catch(() => {});
         await page.waitForTimeout(500);
 
         const nowVisible = await container.isVisible().catch(() => false);
         if (!nowVisible) {
-          console.log('  Form still not visible after scroll, skipping');
+          logWithTime('❌ Form still not visible after scroll, skipping');
           results.ctas.forms.broken++;
           results.ctas.forms.broken_details.push({
             form_index: i + 1,
@@ -885,13 +968,12 @@ async function trackingHealthCheckSite(inputUrl) {
 
       const { filledFields, notes } = await tryFillForm(container);
 
-      // focus to trigger form_start-type listeners
       try {
         const firstInput = container.locator('input:visible, textarea:visible').first();
         const c = await firstInput.count().catch(() => 0);
         if (c) {
           await firstInput.focus().catch(() => {});
-          await firstInput.click().catch(() => {}); // Some trackers need click
+          await firstInput.click().catch(() => {});
           await page.waitForTimeout(400);
         }
       } catch {}
@@ -899,7 +981,6 @@ async function trackingHealthCheckSite(inputUrl) {
       let submitClicked = false;
       let submitReason = null;
 
-      // UPDATED: Try multiple submit selectors
       const submitSelectors = [
         'button[type="submit"]:visible',
         'input[type="submit"]:visible',
@@ -930,7 +1011,7 @@ async function trackingHealthCheckSite(inputUrl) {
             const res = await robustClick(submit, page, 'form_submit');
             if (res.ok) {
               submitClicked = true;
-              console.log(`  Submit clicked via: ${sel}`);
+              logWithTime(`✅ Submit clicked via: ${sel}`);
               break;
             } else {
               submitReason = res.reason;
@@ -942,7 +1023,7 @@ async function trackingHealthCheckSite(inputUrl) {
       }
 
       if (!submitClicked) {
-        console.log(`  Submit not clicked: ${submitReason || 'no button found'}`);
+        logWithTime(`⚠️ Submit not clicked: ${submitReason || 'no button found'}`);
       }
 
       await page.waitForTimeout(2000);
@@ -952,7 +1033,12 @@ async function trackingHealthCheckSite(inputUrl) {
       const ga4Events = uniq(newBeacons.filter(b => b.type === 'GA4').map(b => b.event_name).filter(Boolean));
       const relevant = ga4Events.filter(ev => isRelevantEventName(ev, FORM_EVENT_PATTERNS, IGNORE_EXACT_EVENTS));
 
-      console.log(`  Events: ${ga4Events.join(', ') || 'none'} (relevant: ${relevant.join(', ') || 'none'})`);
+      logWithTime(`📊 Form result`, { 
+        events: ga4Events, 
+        relevant: relevant,
+        filled_fields: filledFields,
+        submit_clicked: submitClicked
+      });
 
       if (relevant.length > 0) {
         results.ctas.forms.working++;
@@ -982,9 +1068,12 @@ async function trackingHealthCheckSite(inputUrl) {
         });
       }
     }
+    
+    logWithTime(`✅ Forms tested: ${results.ctas.forms.working} working, ${results.ctas.forms.broken} broken`);
   }
 
   async function testThisPage(tag) {
+    logWithTime(`🧪 Testing page: ${tag}`);
     results.debug.pages_tested.push({ tag, url: page.url() });
 
     await clickConsentEverywhere(page).catch(() => {});
@@ -995,9 +1084,12 @@ async function trackingHealthCheckSite(inputUrl) {
     await testPhoneLinks(ctas.phoneLocators);
     await testEmailLinks(ctas.emailLocators);
     await testForms(ctas.visibleForms);
+    
+    logWithTime(`✅ Page testing complete: ${tag}`);
   }
 
   async function crawlAndTestContactPages(baseUrl) {
+    logWithTime('🔍 Crawling contact-related pages...');
     const candidates = ['/contact', '/contact-us', '/get-in-touch', '/enquiry', '/quote', '/book', '/booking'];
     const visited = new Set();
 
@@ -1010,24 +1102,27 @@ async function trackingHealthCheckSite(inputUrl) {
       try {
         if (!isSameOrigin(baseUrl, next)) continue;
 
+        logWithTime(`🌐 Navigating to: ${path}`);
         await page.goto(next, { waitUntil: 'domcontentloaded', timeout: 20000 });
         await stabilise(page);
 
         await testThisPage(`crawl:${path}`);
         visited.add(next);
-      } catch {
-        // ignore per-page failures
+      } catch (e) {
+        logWithTime(`⚠️ Failed to test ${path}`, { error: e.message });
       }
     }
+    
+    logWithTime(`✅ Crawl complete, visited ${visited.size} pages`);
   }
 
   try {
     const target = normaliseUrl(inputUrl);
     results.url = target;
 
-    console.log(`\n${'='.repeat(60)}`);
-    console.log(`Starting health check for: ${target}`);
-    console.log('='.repeat(60));
+    logWithTime(`\n${'='.repeat(60)}`);
+    logWithTime(`🚀 Starting health check for: ${target}`);
+    logWithTime('='.repeat(60));
 
     await gotoWithHttpsFallback(target);
 
@@ -1044,8 +1139,8 @@ async function trackingHealthCheckSite(inputUrl) {
     results.tracking.gtm_ids = uniq(tagData.gtm);
     results.tracking.ga4_ids = uniq(tagData.ga4);
 
-    console.log(`GTM IDs: ${results.tracking.gtm_ids.join(', ') || 'none'}`);
-    console.log(`GA4 IDs: ${results.tracking.ga4_ids.join(', ') || 'none'}`);
+    logWithTime(`📊 GTM IDs: ${results.tracking.gtm_ids.join(', ') || 'none'}`);
+    logWithTime(`📊 GA4 IDs: ${results.tracking.ga4_ids.join(', ') || 'none'}`);
 
     const sawGtm = results.tracking.evidence.saw_gtm_js;
     const sawGa4 = results.tracking.evidence.saw_ga4_collect;
@@ -1060,17 +1155,14 @@ async function trackingHealthCheckSite(inputUrl) {
       results.issues.push('❌ CRITICAL: No GTM or GA4 detected (DOM + network)');
     }
 
-    // HOME PAGE TEST
-    console.log('\n--- Testing Home Page ---');
+    logWithTime('\n--- Testing Home Page ---');
     await testThisPage('home');
 
-    // CONTACT-LIKE PAGES TEST (per page)
-    console.log('\n--- Crawling Contact Pages ---');
+    logWithTime('\n--- Crawling Contact Pages ---');
     const baseUrl = results.final_url || page.url();
     const origin = new URL(baseUrl).origin;
     await crawlAndTestContactPages(origin);
 
-    // Final analysis
     const totalTested = results.ctas.phone.total_tested + results.ctas.email.total_tested + results.ctas.forms.total_tested;
     const totalWorking = results.ctas.phone.working + results.ctas.email.working + results.ctas.forms.working;
     const totalBroken = results.ctas.phone.broken + results.ctas.email.broken + results.ctas.forms.broken;
@@ -1084,7 +1176,6 @@ async function trackingHealthCheckSite(inputUrl) {
       results.issues.push('⚠️ GA4 found but no GA4 collect beacons were seen');
     }
 
-    // If we saw embedded iframe forms but found none testable, record it as a warning not "0 forms"
     const embeddedCount = results.debug.embedded_forms.reduce((acc, x) => acc + (x.iframes?.length || 0), 0);
     if (results.ctas.forms.total_found === 0 && embeddedCount > 0) {
       results.issues.push(`⚠️ Form embed detected in iframe (${embeddedCount}) but no testable fields were accessible`);
@@ -1108,19 +1199,24 @@ async function trackingHealthCheckSite(inputUrl) {
 
     await collectTrackingEvidence();
 
-    console.log(`\n${'='.repeat(60)}`);
-    console.log(`Final Status: ${results.overall_status}`);
-    console.log(`Summary: ${results.summary}`);
-    console.log('='.repeat(60));
+    logWithTime(`\n${'='.repeat(60)}`);
+    logWithTime(`✅ Final Status: ${results.overall_status}`);
+    logWithTime(`📊 Summary: ${results.summary}`);
+    logWithTime(`📋 Issues: ${results.issues.length}`);
+    logWithTime('='.repeat(60));
+    
+    logWithTime('🎯 HEALTH CHECK COMPLETE');
   } catch (e) {
     results.overall_status = 'ERROR';
     results.issues.push(`Fatal error: ${e.message}`);
-    console.error('ERROR:', e.message);
+    logWithTime('❌ FATAL ERROR', { error: e.message, stack: e.stack });
     try {
       await collectTrackingEvidence();
     } catch {}
   } finally {
+    logWithTime('🔒 Closing browser...');
     await browser.close().catch(() => {});
+    logWithTime('✅ Browser closed');
   }
 
   return results;
