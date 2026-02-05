@@ -1,6 +1,6 @@
 // /health.runners.js
 // VERSION IDENTIFIER - Update this timestamp each time you push to GitHub
-const SCRIPT_VERSION = "2026-02-05T19:00:00Z";
+const SCRIPT_VERSION = "2026-02-05T20:00:00Z";
 
 const { chromium } = require("playwright");
 
@@ -29,12 +29,14 @@ const MAX_PAGES_TO_VISIT = Number(process.env.HEALTH_MAX_PAGES || 4); // home + 
 const MAX_PHONE_TESTS = Number(process.env.HEALTH_MAX_PHONE || 6);
 const MAX_EMAIL_TESTS = Number(process.env.HEALTH_MAX_EMAIL || 6);
 const NAV_TIMEOUT_MS = Number(process.env.HEALTH_NAV_TIMEOUT_MS || 45000);
-const ACTION_WAIT_MS = Number(process.env.HEALTH_ACTION_WAIT_MS || 6500);
 const INIT_WAIT_MS = Number(process.env.HEALTH_INIT_WAIT_MS || 3500);
 const HEADLESS = (process.env.HEALTH_HEADLESS || "true").toLowerCase() !== "false";
 
 // How long to poll for beacons after CTA click
 const POST_ACTION_POLL_MS = Number(process.env.HEALTH_POST_ACTION_POLL_MS || 8000);
+
+// IMPROVED: Separate longer timeout for form submissions (forms are slower)
+const FORM_SUBMIT_WAIT_MS = Number(process.env.HEALTH_FORM_WAIT_MS || 10000);
 
 // Test identity (safe / non-personal)
 const TEST_VALUES = {
@@ -82,6 +84,20 @@ const CONTACT_PAGE_KEYWORDS = [
   "request"
 ];
 
+// IMPROVED: Common contact page paths to try even if no link found
+const COMMON_CONTACT_PATHS = [
+  "/contact",
+  "/contact-us",
+  "/contact-us/",
+  "/contactus",
+  "/get-in-touch",
+  "/get-in-touch/",
+  "/enquiry",
+  "/enquire",
+  "/book",
+  "/booking"
+];
+
 // Generic events that fire automatically and don't prove tracking works
 // These will be filtered out when determining if tracking fired
 const GENERIC_EVENTS = [
@@ -89,8 +105,7 @@ const GENERIC_EVENTS = [
   "user_engagement",
   "scroll",
   "session_start",
-  "first_visit",
-  "form_start" // interaction, not submission
+  "first_visit"
 ];
 
 // ------------------------------
@@ -247,6 +262,37 @@ async function handleCookieConsent(page) {
 }
 
 // ------------------------------
+// IMPROVED: Try to expand mobile/hidden menus
+// ------------------------------
+async function tryExpandMenus(page) {
+  const menuSelectors = [
+    "button[aria-label*='menu' i]",
+    "button[aria-label*='navigation' i]",
+    ".hamburger",
+    ".menu-toggle",
+    "#menu-toggle",
+    "[class*='mobile-menu-toggle']",
+    "[class*='nav-toggle']"
+  ];
+
+  for (const sel of menuSelectors) {
+    try {
+      const btn = page.locator(sel).first();
+      if (await btn.count()) {
+        if (await btn.isVisible({ timeout: 500 })) {
+          await btn.click({ timeout: 1000 }).catch(() => null);
+          await safeWait(page, 800);
+          logDebug("Expanded menu", { selector: sel });
+          return;
+        }
+      }
+    } catch {
+      // continue trying other selectors
+    }
+  }
+}
+
+// ------------------------------
 // Detect tracking setup
 // ------------------------------
 async function detectTrackingSetup(page, beacons) {
@@ -294,10 +340,14 @@ async function detectTrackingSetup(page, beacons) {
 }
 
 // ------------------------------
-// Discover candidate pages
+// IMPROVED: Discover candidate pages + try common paths
 // ------------------------------
 async function discoverCandidatePages(page, baseUrl) {
   const origin = safeUrlObj(baseUrl)?.origin || null;
+
+  // IMPROVED: First, try to expand any hidden menus
+  await tryExpandMenus(page);
+  await safeWait(page, 500);
 
   const links = await page.evaluate(() => {
     return Array.from(document.querySelectorAll("a[href]")).map((a) => ({
@@ -335,9 +385,24 @@ async function discoverCandidatePages(page, baseUrl) {
   const firstContact = uniqueSorted.find((x) => /contact/.test(x.url.toLowerCase()));
   const rest = uniqueSorted.filter((x) => x !== firstContact);
 
-  return [firstContact?.url, ...rest.map((x) => x.url)]
+  let discovered = [firstContact?.url, ...rest.map((x) => x.url)]
     .filter(Boolean)
     .slice(0, Math.max(0, MAX_PAGES_TO_VISIT - 1));
+
+  // IMPROVED: If no contact pages found via links, try common paths
+  if (discovered.length === 0 && origin) {
+    logDebug("No contact pages found via links, trying common paths");
+    for (const path of COMMON_CONTACT_PATHS) {
+      const commonUrl = origin + path;
+      if (!seen.has(commonUrl)) {
+        discovered.push(commonUrl);
+        seen.add(commonUrl);
+        if (discovered.length >= MAX_PAGES_TO_VISIT - 1) break;
+      }
+    }
+  }
+
+  return discovered;
 }
 
 // ------------------------------
@@ -547,6 +612,7 @@ async function pickBestFirstPartyFormOnPage(page, pageUrl) {
 
 // ------------------------------
 // Form fill + submit (1 per page)
+// IMPROVED: Uses longer timeout for form submissions
 // ------------------------------
 async function testBestFirstPartyForm(page, beacons, pageUrl, formMeta) {
   if (!formMeta || !formMeta.best_form) {
@@ -719,7 +785,8 @@ async function testBestFirstPartyForm(page, beacons, pageUrl, formMeta) {
       }
     }
 
-    await safeWait(page, ACTION_WAIT_MS);
+    // IMPROVED: Use longer timeout for forms (10 seconds instead of 6.5)
+    await safeWait(page, FORM_SUBMIT_WAIT_MS);
 
     const afterUrl = page.url();
     const urlChanged = afterUrl !== beforeUrl;
@@ -915,7 +982,7 @@ async function trackingHealthCheckSite(url) {
       return results;
     }
 
-    // Phase 4: Discover pages
+    // Phase 4: Discover pages (now with common path fallback)
     const discovered = await discoverCandidatePages(page, targetUrl);
     const pagesToVisit = [targetUrl, ...discovered].slice(0, MAX_PAGES_TO_VISIT);
 
