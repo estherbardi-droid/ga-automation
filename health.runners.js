@@ -239,7 +239,6 @@ async function detectTrackingSetup(page, beacons) {
   const tagData = await page.evaluate(() => {
     const tags = { gtm: [], ga4: [], aw: [] };
     const scripts = Array.from(document.querySelectorAll("script"));
-
     for (const s of scripts) {
       const content = (s.innerHTML || "") + " " + (s.src || "");
       const gtm = content.match(/GTM-[A-Z0-9]+/g);
@@ -249,10 +248,8 @@ async function detectTrackingSetup(page, beacons) {
       if (ga4) tags.ga4.push(...ga4);
       if (aw) tags.aw.push(...aw);
     }
-
     const gtmLoaded = !!window.google_tag_manager;
     const gaRuntimePresent = !!window.gtag || !!window.dataLayer;
-
     return {
       gtm: Array.from(new Set(tags.gtm)),
       ga4: Array.from(new Set(tags.ga4)),
@@ -267,14 +264,12 @@ async function detectTrackingSetup(page, beacons) {
     ga4: beacons.filter((b) => b.type === "GA4").length
   };
 
-  const hasGtmTag = tagData.gtm.length > 0;
-  const hasGa4Tag = tagData.ga4.length > 0;
-
   const hasAnyTracking =
-    hasGtmTag ||
-    hasGa4Tag ||
+    tagData.gtm.length > 0 ||
+    tagData.ga4.length > 0 ||
     tagData.gtmLoaded ||
-    (tagData.gaRuntimePresent && beaconCounts.ga4 > 0);
+    beaconCounts.gtm > 0 ||              // FIX
+    beaconCounts.ga4 > 0;                // FIX
 
   return {
     tags_found: { gtm: tagData.gtm, ga4: tagData.ga4, ignored_aw: tagData.aw },
@@ -283,7 +278,6 @@ async function detectTrackingSetup(page, beacons) {
     hasAnyTracking
   };
 }
-
 // ------------------------------
 // Discover candidate pages
 // ------------------------------
@@ -291,26 +285,19 @@ async function discoverCandidatePages(page, baseUrl) {
   const origin = safeUrlObj(baseUrl)?.origin || null;
 
   const links = await page.evaluate(() => {
-    const out = [];
-    const aTags = Array.from(document.querySelectorAll("a[href]"));
-    for (const a of aTags) {
-      const href = a.getAttribute("href") || "";
-      const text = (a.textContent || "").trim().slice(0, 120);
-      out.push({ href, text });
-    }
-    return out;
+    return Array.from(document.querySelectorAll("a[href]")).map((a) => ({
+      href: a.getAttribute("href") || "",
+      text: (a.textContent || "").trim().slice(0, 120)
+    }));
   });
 
   const abs = [];
   for (const l of links) {
     try {
       const u = new URL(l.href, baseUrl).toString();
-      if (!origin) continue;
-      if (!u.startsWith(origin)) continue;
+      if (!origin || !u.startsWith(origin)) continue;
       abs.push({ url: u, text: l.text });
-    } catch {
-      // ignore
-    }
+    } catch {}
   }
 
   const scored = abs
@@ -319,19 +306,23 @@ async function discoverCandidatePages(page, baseUrl) {
       const score = CONTACT_PAGE_KEYWORDS.reduce((acc, k) => (hay.includes(k) ? acc + 1 : acc), 0);
       return { ...x, score };
     })
-    .filter((x) => x.score > 0);
+    .filter((x) => x.score > 0)
+    .sort((a, b) => b.score - a.score);
 
   const seen = new Set();
-  const uniqueSorted = scored
-    .sort((a, b) => b.score - a.score)
-    .filter((x) => {
-      if (seen.has(x.url)) return false;
-      seen.add(x.url);
-      return true;
-    })
-    .slice(0, Math.max(0, MAX_PAGES_TO_VISIT - 1));
+  const uniqueSorted = scored.filter((x) => {
+    if (seen.has(x.url)) return false;
+    seen.add(x.url);
+    return true;
+  });
 
-  return uniqueSorted.map((x) => x.url);
+  // FIX: ensure first contact page is first
+  const firstContact = uniqueSorted.find((x) => /contact/.test(x.url.toLowerCase()));
+  const rest = uniqueSorted.filter((x) => x !== firstContact);
+
+  return [firstContact?.url, ...rest.map((x) => x.url)]
+    .filter(Boolean)
+    .slice(0, Math.max(0, MAX_PAGES_TO_VISIT - 1));
 }
 
 // ------------------------------
@@ -369,7 +360,6 @@ function escapeAttrValue(v) {
 // ------------------------------
 async function testLinkCTA(page, beacons, rawHref, type) {
   const before = beacons.length;
-
   const hrefEsc = escapeAttrValue(rawHref);
   const selector =
     type === "phone"
@@ -378,40 +368,33 @@ async function testLinkCTA(page, beacons, rawHref, type) {
 
   try {
     const loc = page.locator(selector).first();
-    if (!(await loc.count())) {
-      return { status: "NOT_TESTED", reason: "cta_not_found_on_page", beacons_delta: 0 };
-    }
+    if (!(await loc.count())) return { status: "NOT_TESTED", reason: "cta_not_found_on_page", beacons_delta: 0 };
 
     await loc.scrollIntoViewIfNeeded().catch(() => null);
     await safeWait(page, 300);
-    await loc.hover().catch(() => null);
-    await safeWait(page, 250);
 
-    await loc.click({ force: true, timeout: 3000 }).catch((e) => {
-      throw new Error(`click_failed: ${e.message}`);
-    });
-
-    await safeWait(page, ACTION_WAIT_MS);
-
-    const after = beacons.length;
-    const delta = after - before;
-    const newGa4 = beacons.slice(before).filter((b) => b.type === "GA4");
-
-    if (newGa4.length > 0) {
-      return {
-        status: "PASS",
-        reason: null,
-        beacons_delta: delta,
-        ga4_events: uniq(newGa4.map((b) => b.event_name).filter(Boolean)),
-        evidence_urls: newGa4.slice(0, 5).map((b) => b.url)
-      };
+    try {
+      await loc.click({ timeout: 3000 });
+    } catch {
+      await loc.click({ force: true, timeout: 3000 }); // FIX
     }
 
-    return {
-      status: "FAIL",
-      reason: "no_ga4_beacon_after_click",
-      beacons_delta: delta
-    };
+    const start = Date.now();
+    while (Date.now() - start < POST_ACTION_POLL_MS) {
+      await safeWait(page, 800);
+      const newGa4 = beacons.slice(before).filter((b) => b.type === "GA4");
+      if (newGa4.length) {
+        return {
+          status: "PASS",
+          reason: null,
+          beacons_delta: beacons.length - before,
+          ga4_events: uniq(newGa4.map((b) => b.event_name).filter(Boolean)),
+          evidence_urls: newGa4.slice(0, 5).map((b) => b.url)
+        };
+      }
+    }
+
+    return { status: "FAIL", reason: "no_ga4_beacon_after_click", beacons_delta: beacons.length - before };
   } catch (e) {
     return { status: "NOT_TESTED", reason: e.message || "cta_test_error", beacons_delta: 0 };
   }
@@ -421,57 +404,35 @@ async function testLinkCTA(page, beacons, rawHref, type) {
 // Form detection (1 per page)
 // ------------------------------
 async function pickBestFirstPartyFormOnPage(page, pageUrl) {
-  const iframeInfos = await page.evaluate(() => {
-    const iframes = Array.from(document.querySelectorAll("iframe"));
-    return iframes
-      .map((f) => (f.getAttribute("src") || "").trim())
-      .filter(Boolean);
-  });
-
+  const iframeInfos = await page.evaluate(() =>
+    Array.from(document.querySelectorAll("iframe")).map((f) => (f.getAttribute("src") || "").trim()).filter(Boolean)
+  );
   const thirdPartyIframes = iframeInfos.filter((src) => containsAny(src.toLowerCase(), THIRD_PARTY_HINTS));
 
   const formCandidates = await page.evaluate(() => {
     const forms = Array.from(document.querySelectorAll("form"));
     const out = [];
-
-    function textOf(el) {
-      return (el?.textContent || "").replace(/\s+/g, " ").trim().slice(0, 400);
-    }
-    function attr(el, name) {
-      return (el && el.getAttribute && el.getAttribute(name)) || "";
-    }
-    function has(el, selector) {
-      try {
-        return !!el.querySelector(selector);
-      } catch {
-        return false;
-      }
-    }
+    function textOf(el) { return (el?.textContent || "").replace(/\s+/g, " ").trim().slice(0, 400); }
+    function attr(el, name) { return (el && el.getAttribute && el.getAttribute(name)) || ""; }
+    function has(el, selector) { try { return !!el.querySelector(selector); } catch { return false; } }
 
     for (let i = 0; i < forms.length; i++) {
       const f = forms[i];
-
       const action = attr(f, "action");
       const id = attr(f, "id");
       const cls = attr(f, "class");
       const aria = attr(f, "aria-label");
-
       const inputs = f.querySelectorAll("input, textarea, select");
       const inputCount = inputs.length;
 
       const hasTextarea = has(f, "textarea");
-      const hasEmail =
-        has(f, "input[type='email']") ||
-        Array.from(inputs).some((x) => (attr(x, "name") || "").toLowerCase().includes("email"));
-      const hasPhone =
-        has(f, "input[type='tel']") ||
-        Array.from(inputs).some((x) => (attr(x, "name") || "").toLowerCase().includes("phone"));
-      const hasName =
-        Array.from(inputs).some((x) => {
-          const n = (attr(x, "name") || "").toLowerCase();
-          const p = (attr(x, "placeholder") || "").toLowerCase();
-          return n.includes("name") || p.includes("name");
-        });
+      const hasEmail = has(f, "input[type='email']") || Array.from(inputs).some((x) => (attr(x, "name") || "").toLowerCase().includes("email"));
+      const hasPhone = has(f, "input[type='tel']") || Array.from(inputs).some((x) => (attr(x, "name") || "").toLowerCase().includes("phone"));
+      const hasName = Array.from(inputs).some((x) => {
+        const n = (attr(x, "name") || "").toLowerCase();
+        const p = (attr(x, "placeholder") || "").toLowerCase();
+        return n.includes("name") || p.includes("name");
+      });
 
       const submitText = (() => {
         const btn =
@@ -479,12 +440,10 @@ async function pickBestFirstPartyFormOnPage(page, pageUrl) {
           f.querySelector("input[type='submit']") ||
           Array.from(f.querySelectorAll("button")).find((b) => /send|submit|enquir|quote|request|book/i.test(textOf(b))) ||
           null;
-        if (!btn) return "";
-        return textOf(btn);
+        return btn ? textOf(btn) : "";
       })();
 
       const aroundText = textOf(f.closest("section") || f.closest("div") || f.parentElement);
-
       const hay = `${id} ${cls} ${aria} ${submitText} ${aroundText}`.toLowerCase();
       const isNewsletter = /newsletter|subscribe|subscription/.test(hay);
       const isSearch = /search/.test(hay) && inputCount <= 2;
@@ -501,17 +460,7 @@ async function pickBestFirstPartyFormOnPage(page, pageUrl) {
       if (isSearch) score -= 5;
       if (isLogin) score -= 7;
 
-      out.push({
-        index: i,
-        action,
-        inputCount,
-        hasEmail,
-        hasTextarea,
-        hasPhone,
-        hasName,
-        submitText,
-        score
-      });
+      out.push({ index: i, action, inputCount, hasEmail, hasTextarea, hasPhone, hasName, submitText, score });
     }
 
     out.sort((a, b) => (b.score - a.score) || (b.inputCount - a.inputCount));
@@ -519,29 +468,19 @@ async function pickBestFirstPartyFormOnPage(page, pageUrl) {
   });
 
   const best = formCandidates.find((f) => f.score >= 3) || null;
-
   let bestIsThirdPartyByAction = false;
   if (best && best.action) {
     try {
       const actionUrl = new URL(best.action, pageUrl);
       const pageOrigin = new URL(pageUrl).origin;
       const actionLower = actionUrl.href.toLowerCase();
-      if (actionUrl.origin !== pageOrigin && containsAny(actionLower, THIRD_PARTY_HINTS)) {
-        bestIsThirdPartyByAction = true;
-      }
-    } catch {
-      // ignore
-    }
+      if (actionUrl.origin !== pageOrigin && containsAny(actionLower, THIRD_PARTY_HINTS)) bestIsThirdPartyByAction = true;
+    } catch {}
   }
 
   return {
     third_party_iframes: thirdPartyIframes,
-    best_form: best
-      ? {
-          ...best,
-          third_party_by_action: bestIsThirdPartyByAction
-        }
-      : null
+    best_form: best ? { ...best, third_party_by_action: bestIsThirdPartyByAction } : null
   };
 }
 
@@ -549,22 +488,14 @@ async function pickBestFirstPartyFormOnPage(page, pageUrl) {
 // Form fill + submit (1 per page)
 // ------------------------------
 async function testBestFirstPartyForm(page, beacons, pageUrl, formMeta) {
-  if (!formMeta || !formMeta.best_form) {
-    return { status: "NOT_TESTED", reason: "no_first_party_form_found" };
-  }
-  if (formMeta.best_form.third_party_by_action) {
-    return { status: "NOT_TESTED", reason: "third_party_form_action" };
-  }
+  if (!formMeta || !formMeta.best_form) return { status: "NOT_TESTED", reason: "no_first_party_form_found" };
+  if (formMeta.best_form.third_party_by_action) return { status: "NOT_TESTED", reason: "third_party_form_action" };
 
   const captchaFound = await page.evaluate(() => {
-    const html = document.documentElement?.innerHTML?.toLowerCase() || "";
-    const hasRecaptcha =
-      !!document.querySelector("iframe[src*='recaptcha']") ||
-      html.includes("g-recaptcha") ||
-      html.includes("recaptcha");
-    const hasHcaptcha =
-      !!document.querySelector("iframe[src*='hcaptcha']") || html.includes("hcaptcha");
-    return hasRecaptcha || hasHcaptcha;
+    const recaptchaFrame = document.querySelector("iframe[src*='recaptcha']");
+    const hcaptchaFrame = document.querySelector("iframe[src*='hcaptcha']");
+    const isVisible = (el) => el && el.getBoundingClientRect && el.getBoundingClientRect().height > 10;
+    return isVisible(recaptchaFrame) || isVisible(hcaptchaFrame); // FIX
   });
   if (captchaFound) return { status: "NOT_TESTED", reason: "captcha_present" };
 
