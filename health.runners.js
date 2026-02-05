@@ -105,7 +105,7 @@ const GENERIC_EVENTS = [
   "user_engagement",
   "scroll",
   "session_start",
-  "first_visit"
+  "first_visit",
   "form_start"
 ];
 
