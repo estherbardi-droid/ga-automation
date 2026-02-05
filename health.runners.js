@@ -1,6 +1,6 @@
 // /health.runners.js
 // VERSION IDENTIFIER - Update this timestamp each time you push to GitHub
-const SCRIPT_VERSION = "2026-02-05T18:00:00Z";
+const SCRIPT_VERSION = "2026-02-05T19:00:00Z";
 
 const { chromium } = require("playwright");
 
@@ -33,7 +33,7 @@ const ACTION_WAIT_MS = Number(process.env.HEALTH_ACTION_WAIT_MS || 6500);
 const INIT_WAIT_MS = Number(process.env.HEALTH_INIT_WAIT_MS || 3500);
 const HEADLESS = (process.env.HEALTH_HEADLESS || "true").toLowerCase() !== "false";
 
-// FIX: Define the missing variable - how long to poll for beacons after CTA click
+// How long to poll for beacons after CTA click
 const POST_ACTION_POLL_MS = Number(process.env.HEALTH_POST_ACTION_POLL_MS || 8000);
 
 // Test identity (safe / non-personal)
@@ -82,16 +82,15 @@ const CONTACT_PAGE_KEYWORDS = [
   "request"
 ];
 
-// FIX: Define conversion event names that indicate actual form submission
-const FORM_SUBMISSION_EVENTS = [
-  "form_submit",
-  "form_submission",
-  "generate_lead",
-  "submit_lead_form",
-  "contact_form_submit",
-  "contact",
-  "lead",
-  "conversion"
+// Generic events that fire automatically and don't prove tracking works
+// These will be filtered out when determining if tracking fired
+const GENERIC_EVENTS = [
+  "page_view",
+  "user_engagement",
+  "scroll",
+  "session_start",
+  "first_visit",
+  "form_start" // interaction, not submission
 ];
 
 // ------------------------------
@@ -372,7 +371,7 @@ function escapeAttrValue(v) {
 
 // ------------------------------
 // CTA test (click on the same page where first seen)
-// PASS if a new GA4 beacon appears after click
+// PASS if a new MEANINGFUL GA4 beacon appears after click
 // ------------------------------
 async function testLinkCTA(page, beacons, rawHref, type) {
   const before = beacons.length;
@@ -388,7 +387,7 @@ async function testLinkCTA(page, beacons, rawHref, type) {
       return { status: "NOT_TESTED", reason: "cta_not_found_on_page", beacons_delta: 0 };
     }
 
-    // FIX: Better visibility and clickability handling
+    // Better visibility and clickability handling
     try {
       await loc.scrollIntoViewIfNeeded({ timeout: 2000 }).catch(() => null);
       await safeWait(page, 300);
@@ -397,12 +396,12 @@ async function testLinkCTA(page, beacons, rawHref, type) {
       try {
         await loc.click({ timeout: 3000 });
       } catch (normalClickErr) {
-        // FIX: If normal click fails, try force click as fallback
+        // If normal click fails, try force click as fallback
         logDebug("Normal click failed, trying force click", { error: normalClickErr.message });
         try {
           await loc.click({ force: true, timeout: 3000 });
         } catch (forceClickErr) {
-          // FIX: If both fail, try JavaScript click as last resort
+          // If both fail, try JavaScript click as last resort
           logDebug("Force click failed, trying JS click", { error: forceClickErr.message });
           await loc.evaluate((el) => el.click()).catch(() => null);
         }
@@ -419,22 +418,37 @@ async function testLinkCTA(page, beacons, rawHref, type) {
     const start = Date.now();
     while (Date.now() - start < POST_ACTION_POLL_MS) {
       await safeWait(page, 800);
+      
       const newGa4 = beacons.slice(before).filter((b) => b.type === "GA4");
-      if (newGa4.length) {
+      
+      // Filter out generic automatic events
+      const meaningfulEvents = newGa4.filter((b) => {
+        const eventName = (b.event_name || "").toLowerCase();
+        return !GENERIC_EVENTS.some(generic => eventName === generic);
+      });
+
+      if (meaningfulEvents.length) {
         return {
           status: "PASS",
           reason: null,
           beacons_delta: beacons.length - before,
-          ga4_events: uniq(newGa4.map((b) => b.event_name).filter(Boolean)),
-          evidence_urls: newGa4.slice(0, 5).map((b) => b.url)
+          ga4_events: uniq(meaningfulEvents.map((b) => b.event_name).filter(Boolean)),
+          evidence_urls: meaningfulEvents.slice(0, 5).map((b) => b.url)
         };
       }
     }
 
+    // Check what we did see
+    const allNewGa4 = beacons.slice(before).filter((b) => b.type === "GA4");
+    const genericEventsSeen = uniq(allNewGa4.map((b) => b.event_name).filter(Boolean));
+
     return { 
       status: "FAIL", 
-      reason: "no_ga4_beacon_after_click", 
-      beacons_delta: beacons.length - before 
+      reason: genericEventsSeen.length 
+        ? "only_generic_events_fired" 
+        : "no_ga4_beacon_after_click", 
+      beacons_delta: beacons.length - before,
+      generic_events_seen: genericEventsSeen
     };
   } catch (e) {
     return { 
@@ -542,34 +556,7 @@ async function testBestFirstPartyForm(page, beacons, pageUrl, formMeta) {
     return { status: "NOT_TESTED", reason: "third_party_form_action" };
   }
 
-  // FIX: Better captcha detection - only block if captcha is actually visible and blocking
-  const captchaFound = await page.evaluate(() => {
-    const recaptchaFrame = document.querySelector("iframe[src*='recaptcha']");
-    const hcaptchaFrame = document.querySelector("iframe[src*='hcaptcha']");
-    
-    const isActuallyBlocking = (el) => {
-      if (!el) return false;
-      const rect = el.getBoundingClientRect();
-      const style = window.getComputedStyle(el);
-      
-      // Must be visible AND reasonably sized (real captchas are 300x78+ pixels)
-      return (
-        rect.height > 50 &&
-        rect.width > 200 &&
-        style.display !== 'none' &&
-        style.visibility !== 'hidden' &&
-        parseFloat(style.opacity) > 0.1 &&
-        rect.top >= 0 &&
-        rect.top < window.innerHeight
-      );
-    };
-    
-    return isActuallyBlocking(recaptchaFrame) || isActuallyBlocking(hcaptchaFrame);
-  });
-
-  if (captchaFound) {
-    return { status: "NOT_TESTED", reason: "captcha_present" };
-  }
+  // NO CAPTCHA PRE-CHECK - just try to submit and let the results speak
 
   const formIndex = formMeta.best_form.index;
   const form = page.locator("form").nth(formIndex);
@@ -724,7 +711,7 @@ async function testBestFirstPartyForm(page, beacons, pageUrl, formMeta) {
         submit.click({ timeout: 3000 }).then(() => null)
       ]);
     } catch {
-      // FIX: Better click fallback
+      // Better click fallback
       try {
         await submit.click({ force: true, timeout: 3000 });
       } catch {
@@ -744,41 +731,50 @@ async function testBestFirstPartyForm(page, beacons, pageUrl, formMeta) {
         text.includes("thanks for") ||
         text.includes("message has been sent") ||
         text.includes("we will be in touch") ||
-        text.includes("successfully sent")
+        text.includes("successfully sent") ||
+        text.includes("submission successful") ||
+        text.includes("form submitted")
       );
     });
 
     const submittedSuccessfully = urlChanged || navigated || successSignal;
 
-    // FIX: Only look for actual submission events, not interaction events
+    // Get all new GA4 events
     const newGa4 = beacons.slice(beforeBeaconIdx).filter((b) => b.type === "GA4");
-    const submissionEvents = newGa4.filter((b) => {
+    
+    // Filter out generic automatic events
+    const meaningfulEvents = newGa4.filter((b) => {
       const eventName = (b.event_name || "").toLowerCase();
-      // Check if event name contains any submission indicators
-      return FORM_SUBMISSION_EVENTS.some((submitEvent) => 
-        eventName.includes(submitEvent.toLowerCase())
-      );
+      
+      // Special case: page_view counts if URL actually changed (redirect to thank-you page)
+      if (eventName === "page_view" && urlChanged) {
+        return true;
+      }
+      
+      // Filter out all generic events
+      return !GENERIC_EVENTS.some(generic => eventName === generic);
     });
 
-    if (submissionEvents.length > 0) {
+    if (meaningfulEvents.length > 0) {
       return {
         status: "PASS",
         reason: null,
         submittedSuccessfully,
         submit_evidence: { urlChanged, successSignal, navigated, beforeUrl, afterUrl },
-        ga4_events: uniq(submissionEvents.map((b) => b.event_name).filter(Boolean)),
-        evidence_urls: submissionEvents.slice(0, 5).map((b) => b.url)
+        ga4_events: uniq(meaningfulEvents.map((b) => b.event_name).filter(Boolean)),
+        evidence_urls: meaningfulEvents.slice(0, 5).map((b) => b.url)
       };
     }
 
     if (submittedSuccessfully) {
+      const genericEventsSeen = uniq(newGa4.map((b) => b.event_name).filter(Boolean));
       return {
         status: "FAIL",
-        reason: "submitted_but_no_ga4_submission_event",
+        reason: "submitted_but_no_meaningful_ga4_event",
         submittedSuccessfully,
         submit_evidence: { urlChanged, successSignal, navigated, beforeUrl, afterUrl },
-        ga4_events: uniq(newGa4.map((b) => b.event_name).filter(Boolean)),
-        note: "Form submitted successfully but only saw interaction events (form_start, scroll, etc), not submission events"
+        ga4_events: genericEventsSeen,
+        note: "Form submitted successfully but only saw generic automatic events (page_view, scroll, user_engagement, form_start). No conversion event fired."
       };
     }
 
@@ -786,7 +782,7 @@ async function testBestFirstPartyForm(page, beacons, pageUrl, formMeta) {
       .evaluate(() => {
         const els = Array.from(
           document.querySelectorAll(
-            "[role='alert'], .error, .wpcf7-not-valid-tip, .wpcf7-response-output"
+            "[role='alert'], .error, .wpcf7-not-valid-tip, .wpcf7-response-output, .error-message, .validation-error"
           )
         );
         const txt = els.map((e) => (e.textContent || "").trim()).filter(Boolean).slice(0, 3);
@@ -796,7 +792,9 @@ async function testBestFirstPartyForm(page, beacons, pageUrl, formMeta) {
 
     return {
       status: "NOT_TESTED",
-      reason: validationText ? `validation_blocked: ${validationText}` : "submit_not_confirmed",
+      reason: validationText 
+        ? `validation_blocked: ${validationText}` 
+        : "submit_not_confirmed",
       ga4_events: uniq(newGa4.map((b) => b.event_name).filter(Boolean))
     };
   } catch (e) {
@@ -966,7 +964,8 @@ async function trackingHealthCheckSite(url) {
             reason: item.reason || null,
             ga4_events: item.ga4_events || [],
             beacons_delta: item.beacons_delta || 0,
-            evidence_urls: item.evidence_urls || []
+            evidence_urls: item.evidence_urls || [],
+            generic_events_seen: item.generic_events_seen || []
           });
         }
       }
@@ -992,7 +991,8 @@ async function trackingHealthCheckSite(url) {
             reason: item.reason || null,
             ga4_events: item.ga4_events || [],
             beacons_delta: item.beacons_delta || 0,
-            evidence_urls: item.evidence_urls || []
+            evidence_urls: item.evidence_urls || [],
+            generic_events_seen: item.generic_events_seen || []
           });
         }
       }
@@ -1055,8 +1055,8 @@ async function trackingHealthCheckSite(url) {
     else if (formFail || ctaFail) results.site_status = "BROKEN";
     else results.site_status = "NOT_FULLY_TESTED";
 
-    if (formFail) results.issues.push("At least one form submitted but no GA4 submission event fired");
-    if (ctaFail) results.issues.push("At least one CTA click produced no GA4 beacon");
+    if (formFail) results.issues.push("At least one form submitted but no meaningful GA4 event fired");
+    if (ctaFail) results.issues.push("At least one CTA click produced no meaningful GA4 beacon");
 
     results.evidence.network_beacons = beacons;
 
