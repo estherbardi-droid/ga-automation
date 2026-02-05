@@ -788,6 +788,8 @@ async function testBestFirstPartyForm(page, beacons, pageUrl, formMeta) {
 
     // IMPROVED: Use longer timeout for forms (10 seconds instead of 6.5)
     await safeWait(page, FORM_SUBMIT_WAIT_MS);
+    await page.screenshot({ path: '/tmp/form-submit-debug.png', fullPage: true }).catch(() => null);
+logInfo("📸 Screenshot saved to /tmp/form-submit-debug.png");
 
     const afterUrl = page.url();
     const urlChanged = afterUrl !== beforeUrl;
