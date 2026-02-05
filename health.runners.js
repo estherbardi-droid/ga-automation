@@ -25,9 +25,9 @@ function logDebug(msg, data = null) {
 // ------------------------------
 // Config
 // ------------------------------
-const MAX_PAGES_TO_VISIT = Number(process.env.HEALTH_MAX_PAGES || 4); // home + 3
-const MAX_PHONE_TESTS = Number(process.env.HEALTH_MAX_PHONE || 6);
-const MAX_EMAIL_TESTS = Number(process.env.HEALTH_MAX_EMAIL || 6);
+const MAX_PAGES_TO_VISIT = Number(process.env.HEALTH_MAX_PAGES || 10);
+const MAX_PHONE_TESTS = Number(process.env.HEALTH_MAX_PHONE || 10);
+const MAX_EMAIL_TESTS = Number(process.env.HEALTH_MAX_EMAIL || 10);
 const NAV_TIMEOUT_MS = Number(process.env.HEALTH_NAV_TIMEOUT_MS || 45000);
 const INIT_WAIT_MS = Number(process.env.HEALTH_INIT_WAIT_MS || 3500);
 const HEADLESS = (process.env.HEALTH_HEADLESS || "true").toLowerCase() !== "false";
@@ -106,6 +106,7 @@ const GENERIC_EVENTS = [
   "scroll",
   "session_start",
   "first_visit"
+  "form_start"
 ];
 
 // ------------------------------
@@ -1115,13 +1116,22 @@ async function trackingHealthCheckSite(url) {
       results.ctas.phones.items.some((x) => x.status === "FAIL") ||
       results.ctas.emails.items.some((x) => x.status === "FAIL");
 
-    const anyPass = anyCtaPass || formPass;
+   const anyPass = anyCtaPass || formPass;
+const anyFail = formFail || ctaFail;
 
-    if (anyPass && (formFail || ctaFail)) results.site_status = "PARTIAL";
-    else if (anyPass) results.site_status = "HEALTHY";
-    else if (formFail || ctaFail) results.site_status = "BROKEN";
-    else results.site_status = "NOT_FULLY_TESTED";
+// HEALTHY = everything tested passed, nothing failed
+const allTestedPassed = anyPass && !anyFail;
 
+// PARTIAL = some passed AND some failed (tracking works but incomplete)
+const somePassSomeFail = anyPass && anyFail;
+
+// FAILED = tracking is set up but nothing works (all fails, no passes)
+const trackingSetupButBroken = anyFail && !anyPass;
+
+if (allTestedPassed) results.site_status = "HEALTHY";
+else if (somePassSomeFail) results.site_status = "PARTIAL";
+else if (trackingSetupButBroken) results.site_status = "FAILED";
+else results.site_status = "NOT_FULLY_TESTED";
     if (formFail) results.issues.push("At least one form submitted but no meaningful GA4 event fired");
     if (ctaFail) results.issues.push("At least one CTA click produced no meaningful GA4 beacon");
 
