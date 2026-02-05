@@ -1,6 +1,6 @@
 // /health.runners.js
 // VERSION IDENTIFIER - Update this timestamp each time you push to GitHub
-const SCRIPT_VERSION = "2026-02-05T16:40:00Z";
+const SCRIPT_VERSION = "2026-02-05T18:00:00Z";
 
 const { chromium } = require("playwright");
 
@@ -32,6 +32,9 @@ const NAV_TIMEOUT_MS = Number(process.env.HEALTH_NAV_TIMEOUT_MS || 45000);
 const ACTION_WAIT_MS = Number(process.env.HEALTH_ACTION_WAIT_MS || 6500);
 const INIT_WAIT_MS = Number(process.env.HEALTH_INIT_WAIT_MS || 3500);
 const HEADLESS = (process.env.HEALTH_HEADLESS || "true").toLowerCase() !== "false";
+
+// FIX: Define the missing variable - how long to poll for beacons after CTA click
+const POST_ACTION_POLL_MS = Number(process.env.HEALTH_POST_ACTION_POLL_MS || 8000);
 
 // Test identity (safe / non-personal)
 const TEST_VALUES = {
@@ -77,6 +80,18 @@ const CONTACT_PAGE_KEYWORDS = [
   "appointment",
   "consultation",
   "request"
+];
+
+// FIX: Define conversion event names that indicate actual form submission
+const FORM_SUBMISSION_EVENTS = [
+  "form_submit",
+  "form_submission",
+  "generate_lead",
+  "submit_lead_form",
+  "contact_form_submit",
+  "contact",
+  "lead",
+  "conversion"
 ];
 
 // ------------------------------
@@ -268,8 +283,8 @@ async function detectTrackingSetup(page, beacons) {
     tagData.gtm.length > 0 ||
     tagData.ga4.length > 0 ||
     tagData.gtmLoaded ||
-    beaconCounts.gtm > 0 ||              // FIX
-    beaconCounts.ga4 > 0;                // FIX
+    beaconCounts.gtm > 0 ||
+    beaconCounts.ga4 > 0;
 
   return {
     tags_found: { gtm: tagData.gtm, ga4: tagData.ga4, ignored_aw: tagData.aw },
@@ -278,6 +293,7 @@ async function detectTrackingSetup(page, beacons) {
     hasAnyTracking
   };
 }
+
 // ------------------------------
 // Discover candidate pages
 // ------------------------------
@@ -316,7 +332,7 @@ async function discoverCandidatePages(page, baseUrl) {
     return true;
   });
 
-  // FIX: ensure first contact page is first
+  // Ensure first contact page is first
   const firstContact = uniqueSorted.find((x) => /contact/.test(x.url.toLowerCase()));
   const rest = uniqueSorted.filter((x) => x !== firstContact);
 
@@ -368,17 +384,38 @@ async function testLinkCTA(page, beacons, rawHref, type) {
 
   try {
     const loc = page.locator(selector).first();
-    if (!(await loc.count())) return { status: "NOT_TESTED", reason: "cta_not_found_on_page", beacons_delta: 0 };
-
-    await loc.scrollIntoViewIfNeeded().catch(() => null);
-    await safeWait(page, 300);
-
-    try {
-      await loc.click({ timeout: 3000 });
-    } catch {
-      await loc.click({ force: true, timeout: 3000 }); // FIX
+    if (!(await loc.count())) {
+      return { status: "NOT_TESTED", reason: "cta_not_found_on_page", beacons_delta: 0 };
     }
 
+    // FIX: Better visibility and clickability handling
+    try {
+      await loc.scrollIntoViewIfNeeded({ timeout: 2000 }).catch(() => null);
+      await safeWait(page, 300);
+
+      // Try normal click first
+      try {
+        await loc.click({ timeout: 3000 });
+      } catch (normalClickErr) {
+        // FIX: If normal click fails, try force click as fallback
+        logDebug("Normal click failed, trying force click", { error: normalClickErr.message });
+        try {
+          await loc.click({ force: true, timeout: 3000 });
+        } catch (forceClickErr) {
+          // FIX: If both fail, try JavaScript click as last resort
+          logDebug("Force click failed, trying JS click", { error: forceClickErr.message });
+          await loc.evaluate((el) => el.click()).catch(() => null);
+        }
+      }
+    } catch (scrollErr) {
+      return { 
+        status: "NOT_TESTED", 
+        reason: `element_interaction_failed: ${scrollErr.message}`, 
+        beacons_delta: 0 
+      };
+    }
+
+    // Poll for new beacons
     const start = Date.now();
     while (Date.now() - start < POST_ACTION_POLL_MS) {
       await safeWait(page, 800);
@@ -394,9 +431,17 @@ async function testLinkCTA(page, beacons, rawHref, type) {
       }
     }
 
-    return { status: "FAIL", reason: "no_ga4_beacon_after_click", beacons_delta: beacons.length - before };
+    return { 
+      status: "FAIL", 
+      reason: "no_ga4_beacon_after_click", 
+      beacons_delta: beacons.length - before 
+    };
   } catch (e) {
-    return { status: "NOT_TESTED", reason: e.message || "cta_test_error", beacons_delta: 0 };
+    return { 
+      status: "NOT_TESTED", 
+      reason: `cta_test_error: ${e.message}`, 
+      beacons_delta: 0 
+    };
   }
 }
 
@@ -474,7 +519,9 @@ async function pickBestFirstPartyFormOnPage(page, pageUrl) {
       const actionUrl = new URL(best.action, pageUrl);
       const pageOrigin = new URL(pageUrl).origin;
       const actionLower = actionUrl.href.toLowerCase();
-      if (actionUrl.origin !== pageOrigin && containsAny(actionLower, THIRD_PARTY_HINTS)) bestIsThirdPartyByAction = true;
+      if (actionUrl.origin !== pageOrigin && containsAny(actionLower, THIRD_PARTY_HINTS)) {
+        bestIsThirdPartyByAction = true;
+      }
     } catch {}
   }
 
@@ -488,29 +535,60 @@ async function pickBestFirstPartyFormOnPage(page, pageUrl) {
 // Form fill + submit (1 per page)
 // ------------------------------
 async function testBestFirstPartyForm(page, beacons, pageUrl, formMeta) {
-  if (!formMeta || !formMeta.best_form) return { status: "NOT_TESTED", reason: "no_first_party_form_found" };
-  if (formMeta.best_form.third_party_by_action) return { status: "NOT_TESTED", reason: "third_party_form_action" };
+  if (!formMeta || !formMeta.best_form) {
+    return { status: "NOT_TESTED", reason: "no_first_party_form_found" };
+  }
+  if (formMeta.best_form.third_party_by_action) {
+    return { status: "NOT_TESTED", reason: "third_party_form_action" };
+  }
 
+  // FIX: Better captcha detection - only block if captcha is actually visible and blocking
   const captchaFound = await page.evaluate(() => {
     const recaptchaFrame = document.querySelector("iframe[src*='recaptcha']");
     const hcaptchaFrame = document.querySelector("iframe[src*='hcaptcha']");
-    const isVisible = (el) => el && el.getBoundingClientRect && el.getBoundingClientRect().height > 10;
-    return isVisible(recaptchaFrame) || isVisible(hcaptchaFrame); // FIX
+    
+    const isActuallyBlocking = (el) => {
+      if (!el) return false;
+      const rect = el.getBoundingClientRect();
+      const style = window.getComputedStyle(el);
+      
+      // Must be visible AND reasonably sized (real captchas are 300x78+ pixels)
+      return (
+        rect.height > 50 &&
+        rect.width > 200 &&
+        style.display !== 'none' &&
+        style.visibility !== 'hidden' &&
+        parseFloat(style.opacity) > 0.1 &&
+        rect.top >= 0 &&
+        rect.top < window.innerHeight
+      );
+    };
+    
+    return isActuallyBlocking(recaptchaFrame) || isActuallyBlocking(hcaptchaFrame);
   });
-  if (captchaFound) return { status: "NOT_TESTED", reason: "captcha_present" };
+
+  if (captchaFound) {
+    return { status: "NOT_TESTED", reason: "captcha_present" };
+  }
 
   const formIndex = formMeta.best_form.index;
   const form = page.locator("form").nth(formIndex);
 
   try {
-    if (!(await form.count())) return { status: "NOT_TESTED", reason: "form_locator_not_found" };
+    if (!(await form.count())) {
+      return { status: "NOT_TESTED", reason: "form_locator_not_found" };
+    }
+    
     await form.scrollIntoViewIfNeeded().catch(() => null);
     await safeWait(page, 400);
 
     const fields = form.locator("input, textarea, select");
     const fieldCount = await fields.count();
-    if (fieldCount < 2) return { status: "NOT_TESTED", reason: "form_too_small" };
+    if (fieldCount < 2) {
+      return { status: "NOT_TESTED", reason: "form_too_small" };
+    }
 
+    // Fill form fields
     for (let i = 0; i < fieldCount; i++) {
       const el = fields.nth(i);
       try {
@@ -599,6 +677,7 @@ async function testBestFirstPartyForm(page, beacons, pageUrl, formMeta) {
       }
     }
 
+    // Find submit button
     const submitCandidates = [
       "button[type='submit']",
       "input[type='submit']",
@@ -626,7 +705,10 @@ async function testBestFirstPartyForm(page, beacons, pageUrl, formMeta) {
         // ignore
       }
     }
-    if (!submit) return { status: "NOT_TESTED", reason: "no_submit_button_found" };
+    
+    if (!submit) {
+      return { status: "NOT_TESTED", reason: "no_submit_button_found" };
+    }
 
     const beforeBeaconIdx = beacons.length;
     const beforeUrl = page.url();
@@ -642,7 +724,12 @@ async function testBestFirstPartyForm(page, beacons, pageUrl, formMeta) {
         submit.click({ timeout: 3000 }).then(() => null)
       ]);
     } catch {
-      await submit.click({ force: true, timeout: 3000 }).catch(() => null);
+      // FIX: Better click fallback
+      try {
+        await submit.click({ force: true, timeout: 3000 });
+      } catch {
+        await submit.evaluate((el) => el.click()).catch(() => null);
+      }
     }
 
     await safeWait(page, ACTION_WAIT_MS);
@@ -663,24 +750,35 @@ async function testBestFirstPartyForm(page, beacons, pageUrl, formMeta) {
 
     const submittedSuccessfully = urlChanged || navigated || successSignal;
 
+    // FIX: Only look for actual submission events, not interaction events
     const newGa4 = beacons.slice(beforeBeaconIdx).filter((b) => b.type === "GA4");
-    if (newGa4.length > 0) {
+    const submissionEvents = newGa4.filter((b) => {
+      const eventName = (b.event_name || "").toLowerCase();
+      // Check if event name contains any submission indicators
+      return FORM_SUBMISSION_EVENTS.some((submitEvent) => 
+        eventName.includes(submitEvent.toLowerCase())
+      );
+    });
+
+    if (submissionEvents.length > 0) {
       return {
         status: "PASS",
         reason: null,
         submittedSuccessfully,
         submit_evidence: { urlChanged, successSignal, navigated, beforeUrl, afterUrl },
-        ga4_events: uniq(newGa4.map((b) => b.event_name).filter(Boolean)),
-        evidence_urls: newGa4.slice(0, 5).map((b) => b.url)
+        ga4_events: uniq(submissionEvents.map((b) => b.event_name).filter(Boolean)),
+        evidence_urls: submissionEvents.slice(0, 5).map((b) => b.url)
       };
     }
 
     if (submittedSuccessfully) {
       return {
         status: "FAIL",
-        reason: "submitted_but_no_ga4_beacon",
+        reason: "submitted_but_no_ga4_submission_event",
         submittedSuccessfully,
-        submit_evidence: { urlChanged, successSignal, navigated, beforeUrl, afterUrl }
+        submit_evidence: { urlChanged, successSignal, navigated, beforeUrl, afterUrl },
+        ga4_events: uniq(newGa4.map((b) => b.event_name).filter(Boolean)),
+        note: "Form submitted successfully but only saw interaction events (form_start, scroll, etc), not submission events"
       };
     }
 
@@ -698,10 +796,14 @@ async function testBestFirstPartyForm(page, beacons, pageUrl, formMeta) {
 
     return {
       status: "NOT_TESTED",
-      reason: validationText ? `validation_blocked: ${validationText}` : "submit_not_confirmed"
+      reason: validationText ? `validation_blocked: ${validationText}` : "submit_not_confirmed",
+      ga4_events: uniq(newGa4.map((b) => b.event_name).filter(Boolean))
     };
   } catch (e) {
-    return { status: "NOT_TESTED", reason: e.message || "form_test_error" };
+    return { 
+      status: "NOT_TESTED", 
+      reason: `form_test_error: ${e.message}` 
+    };
   }
 }
 
@@ -735,7 +837,7 @@ async function trackingHealthCheckSite(url) {
 
     forms: {
       third_party_iframes_found: [],
-      pages: [] // per page: { page_url, status, reason, meta... }
+      pages: []
     },
 
     evidence: { network_beacons: [] },
@@ -819,8 +921,7 @@ async function trackingHealthCheckSite(url) {
     const discovered = await discoverCandidatePages(page, targetUrl);
     const pagesToVisit = [targetUrl, ...discovered].slice(0, MAX_PAGES_TO_VISIT);
 
-    // CTA tracking (Option A):
-    // - Collect and test CTAs on the FIRST page where they appear
+    // CTA tracking collections
     const allPhonesNorm = new Set();
     const allEmailsNorm = new Set();
     const testedPhonesNorm = new Set();
@@ -924,7 +1025,8 @@ async function trackingHealthCheckSite(url) {
         submittedSuccessfully: formTest.submittedSuccessfully ?? null,
         submit_evidence: formTest.submit_evidence ?? null,
         ga4_events: formTest.ga4_events ?? [],
-        evidence_urls: formTest.evidence_urls ?? []
+        evidence_urls: formTest.evidence_urls ?? [],
+        note: formTest.note ?? null
       });
 
       await safeWait(page, 400);
@@ -953,7 +1055,7 @@ async function trackingHealthCheckSite(url) {
     else if (formFail || ctaFail) results.site_status = "BROKEN";
     else results.site_status = "NOT_FULLY_TESTED";
 
-    if (formFail) results.issues.push("At least one form submitted but no GA4 beacon fired");
+    if (formFail) results.issues.push("At least one form submitted but no GA4 submission event fired");
     if (ctaFail) results.issues.push("At least one CTA click produced no GA4 beacon");
 
     results.evidence.network_beacons = beacons;
