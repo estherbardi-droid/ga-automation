@@ -788,8 +788,6 @@ async function testBestFirstPartyForm(page, beacons, pageUrl, formMeta) {
 
     // IMPROVED: Use longer timeout for forms (10 seconds instead of 6.5)
     await safeWait(page, FORM_SUBMIT_WAIT_MS);
-    await page.screenshot({ path: '/tmp/form-submit-debug.png', fullPage: true }).catch(() => null);
-logInfo("📸 Screenshot saved to /tmp/form-submit-debug.png");
 
     const afterUrl = page.url();
     const urlChanged = afterUrl !== beforeUrl;
@@ -844,7 +842,7 @@ logInfo("📸 Screenshot saved to /tmp/form-submit-debug.png");
         submittedSuccessfully,
         submit_evidence: { urlChanged, successSignal, navigated, beforeUrl, afterUrl },
         ga4_events: genericEventsSeen,
-        note: "Form submitted successfully but only saw generic automatic events (page_view, scroll, user_engagement, form_start). No conversion event fired."
+        note: "Form submitted successfully but only saw generic automatic events. No conversion event fired."
       };
     }
 
@@ -860,12 +858,22 @@ logInfo("📸 Screenshot saved to /tmp/form-submit-debug.png");
       })
       .catch(() => "");
 
+    // Capture what's actually on the page
+    const pageContent = await page.evaluate(() => {
+      return {
+        title: document.title,
+        bodyText: document.body.innerText.slice(0, 500),
+        url: window.location.href
+      };
+    }).catch(() => null);
+
     return {
       status: "NOT_TESTED",
       reason: validationText 
         ? `validation_blocked: ${validationText}` 
         : "submit_not_confirmed",
-      ga4_events: uniq(newGa4.map((b) => b.event_name).filter(Boolean))
+      ga4_events: uniq(newGa4.map((b) => b.event_name).filter(Boolean)),
+      debug_page_state: pageContent
     };
   } catch (e) {
     return { 
@@ -922,7 +930,6 @@ async function trackingHealthCheckSite(url) {
   });
 
   const context = await browser.newContext();
-  await context.tracing.start({ screenshots: true, snapshots: true, sources: true });
   const page = await context.newPage();
 
   page.on("request", (request) => {
@@ -1097,7 +1104,8 @@ async function trackingHealthCheckSite(url) {
         submit_evidence: formTest.submit_evidence ?? null,
         ga4_events: formTest.ga4_events ?? [],
         evidence_urls: formTest.evidence_urls ?? [],
-        note: formTest.note ?? null
+        note: formTest.note ?? null,
+        debug_page_state: formTest.debug_page_state ?? null
       });
 
       await safeWait(page, 400);
@@ -1119,22 +1127,23 @@ async function trackingHealthCheckSite(url) {
       results.ctas.phones.items.some((x) => x.status === "FAIL") ||
       results.ctas.emails.items.some((x) => x.status === "FAIL");
 
-   const anyPass = anyCtaPass || formPass;
-const anyFail = formFail || ctaFail;
+    const anyPass = anyCtaPass || formPass;
+    const anyFail = formFail || ctaFail;
 
-// HEALTHY = everything tested passed, nothing failed
-const allTestedPassed = anyPass && !anyFail;
+    // HEALTHY = everything tested passed, nothing failed
+    const allTestedPassed = anyPass && !anyFail;
 
-// PARTIAL = some passed AND some failed (tracking works but incomplete)
-const somePassSomeFail = anyPass && anyFail;
+    // PARTIAL = some passed AND some failed (tracking works but incomplete)
+    const somePassSomeFail = anyPass && anyFail;
 
-// FAILED = tracking is set up but nothing works (all fails, no passes)
-const trackingSetupButBroken = anyFail && !anyPass;
+    // FAILED = tracking is set up but nothing works (all fails, no passes)
+    const trackingSetupButBroken = anyFail && !anyPass;
 
-if (allTestedPassed) results.site_status = "HEALTHY";
-else if (somePassSomeFail) results.site_status = "PARTIAL";
-else if (trackingSetupButBroken) results.site_status = "FAILED";
-else results.site_status = "NOT_FULLY_TESTED";
+    if (allTestedPassed) results.site_status = "HEALTHY";
+    else if (somePassSomeFail) results.site_status = "PARTIAL";
+    else if (trackingSetupButBroken) results.site_status = "FAILED";
+    else results.site_status = "NOT_FULLY_TESTED";
+
     if (formFail) results.issues.push("At least one form submitted but no meaningful GA4 event fired");
     if (ctaFail) results.issues.push("At least one CTA click produced no meaningful GA4 beacon");
 
@@ -1158,10 +1167,6 @@ else results.site_status = "NOT_FULLY_TESTED";
     results.evidence.network_beacons = beacons;
     return results;
   } finally {
-     try {
-    // SAVE TRACE - ADD THIS
-    await context.tracing.stop({ path: `/opt/python/ga-automation/static/trace-${Date.now()}.zip` });
-  } catch {}
     try {
       await browser.close();
     } catch {
