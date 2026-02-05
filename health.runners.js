@@ -922,6 +922,7 @@ async function trackingHealthCheckSite(url) {
   });
 
   const context = await browser.newContext();
+  await context.tracing.start({ screenshots: true, snapshots: true, sources: true });
   const page = await context.newPage();
 
   page.on("request", (request) => {
@@ -1157,6 +1158,10 @@ else results.site_status = "NOT_FULLY_TESTED";
     results.evidence.network_beacons = beacons;
     return results;
   } finally {
+     try {
+    // SAVE TRACE - ADD THIS
+    await context.tracing.stop({ path: `/opt/python/ga-automation/static/trace-${Date.now()}.zip` });
+  } catch {}
     try {
       await browser.close();
     } catch {
