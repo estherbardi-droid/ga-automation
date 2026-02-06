@@ -1,6 +1,6 @@
 // /health.runners.js
 // VERSION IDENTIFIER - Update this timestamp each time you push to GitHub
-const SCRIPT_VERSION = "2026-02-05T20:00:00Z";
+const SCRIPT_VERSION = "2026-02-05T21:00:00Z-DEBUG";
 
 const { chromium } = require("playwright");
 
@@ -36,7 +36,8 @@ const HEADLESS = (process.env.HEALTH_HEADLESS || "true").toLowerCase() !== "fals
 const POST_ACTION_POLL_MS = Number(process.env.HEALTH_POST_ACTION_POLL_MS || 8000);
 
 // IMPROVED: Separate longer timeout for form submissions (forms are slower)
-const FORM_SUBMIT_WAIT_MS = Number(process.env.HEALTH_FORM_WAIT_MS || 10000);
+// DEFAULT INCREASED TO 15 SECONDS FOR BETTER BEACON CAPTURE
+const FORM_SUBMIT_WAIT_MS = Number(process.env.HEALTH_FORM_WAIT_MS || 15000);
 
 // Test identity (safe / non-personal)
 const TEST_VALUES = {
@@ -613,7 +614,7 @@ async function pickBestFirstPartyFormOnPage(page, pageUrl) {
 
 // ------------------------------
 // Form fill + submit (1 per page)
-// IMPROVED: Uses longer timeout for form submissions
+// IMPROVED: Uses longer timeout for form submissions + DEBUG LOGGING
 // ------------------------------
 async function testBestFirstPartyForm(page, beacons, pageUrl, formMeta) {
   if (!formMeta || !formMeta.best_form) {
@@ -731,6 +732,10 @@ async function testBestFirstPartyForm(page, beacons, pageUrl, formMeta) {
       }
     }
 
+    // IMPORTANT: Wait for any JavaScript validation to complete
+    await safeWait(page, 800);
+
+
     // Find submit button
     const submitCandidates = [
       "button[type='submit']",
@@ -746,12 +751,14 @@ async function testBestFirstPartyForm(page, beacons, pageUrl, formMeta) {
     ];
 
     let submit = null;
+    let submitSelector = null;
     for (const sel of submitCandidates) {
       const loc = form.locator(sel).first();
       try {
         if (await loc.count()) {
           if (await loc.isVisible({ timeout: 600 })) {
             submit = loc;
+            submitSelector = sel;
             break;
           }
         }
@@ -768,25 +775,66 @@ async function testBestFirstPartyForm(page, beacons, pageUrl, formMeta) {
     const beforeUrl = page.url();
 
     await submit.scrollIntoViewIfNeeded().catch(() => null);
+    await safeWait(page, 300);
 
     let navigated = false;
+    let submitted = false;
+    
+    // Try multiple submission methods aggressively
+    // METHOD 1: Normal click with navigation detection
     try {
       await Promise.race([
         page.waitForNavigation({ timeout: 9000 }).then(() => {
           navigated = true;
         }),
-        submit.click({ timeout: 3000 }).then(() => null)
+        submit.click({ timeout: 3000 }).then(() => {
+          submitted = true;
+        })
       ]);
-    } catch {
-      // Better click fallback
+    } catch (err1) {
+      // METHOD 2: Force click
       try {
         await submit.click({ force: true, timeout: 3000 });
-      } catch {
-        await submit.evaluate((el) => el.click()).catch(() => null);
+        submitted = true;
+      } catch (err2) {
+        // METHOD 3: JavaScript click on button
+        try {
+          await submit.evaluate((el) => el.click());
+          submitted = true;
+        } catch (err3) {
+          // METHOD 4: Direct form.submit() via JavaScript
+          try {
+            await form.evaluate((f) => {
+              // Try HTMLFormElement.submit()
+              if (f.submit && typeof f.submit === 'function') {
+                f.submit();
+                return true;
+              }
+              // Try requesting submission
+              if (f.requestSubmit) {
+                f.requestSubmit();
+                return true;
+              }
+              return false;
+            });
+            submitted = true;
+          } catch (err4) {
+            // METHOD 5: Press Enter in a field to trigger submission
+            try {
+              const textField = form.locator('input[type="text"], input[type="email"], input[type="tel"]').first();
+              if (await textField.count()) {
+                await textField.press('Enter');
+                submitted = true;
+              }
+            } catch (err5) {
+              // All methods failed
+            }
+          }
+        }
       }
     }
-
-    // IMPROVED: Use longer timeout for forms (10 seconds instead of 6.5)
+    
+    // IMPROVED: Use longer timeout for forms (15 seconds default)
     await safeWait(page, FORM_SUBMIT_WAIT_MS);
 
     const afterUrl = page.url();
@@ -810,6 +858,13 @@ async function testBestFirstPartyForm(page, beacons, pageUrl, formMeta) {
     // Get all new GA4 events
     const newGa4 = beacons.slice(beforeBeaconIdx).filter((b) => b.type === "GA4");
     
+    // Show what we captured (concise)
+    if (newGa4.length > 0) {
+      console.log(`\n📊 Captured ${newGa4.length} GA4 events: ${newGa4.map(b => b.event_name || 'unnamed').join(', ')}`);
+    } else {
+      console.log(`\n⚠️  No GA4 events captured after form submit`);
+    }
+    
     // Filter out generic automatic events
     const meaningfulEvents = newGa4.filter((b) => {
       const eventName = (b.event_name || "").toLowerCase();
@@ -822,6 +877,12 @@ async function testBestFirstPartyForm(page, beacons, pageUrl, formMeta) {
       // Filter out all generic events
       return !GENERIC_EVENTS.some(generic => eventName === generic);
     });
+
+    if (meaningfulEvents.length > 0) {
+      console.log(`✅ Found ${meaningfulEvents.length} meaningful events: ${meaningfulEvents.map(b => b.event_name).join(', ')}\n`);
+    } else if (newGa4.length > 0) {
+      console.log(`⚠️  Only generic events (${newGa4.map(b => b.event_name).join(', ')}) - no conversion tracking\n`);
+    }
 
     if (meaningfulEvents.length > 0) {
       return {
@@ -963,6 +1024,9 @@ async function trackingHealthCheckSite(url) {
       type,
       event_name: eventName
     });
+
+    // Only log beacons during form submission (when we're actively watching for them)
+    // This keeps logs clean at scale
   });
 
   try {
@@ -1178,3 +1242,4 @@ async function trackingHealthCheckSite(url) {
 module.exports = {
   trackingHealthCheckSite
 };
+      
