@@ -1,6 +1,6 @@
 // /health.runners.js
-// PRODUCTION VERSION - Constraint Satisfaction + Detailed Blocker Reporting
-const SCRIPT_VERSION = "2026-02-06T11:30:00Z-PRODUCTION-V2";
+// PRODUCTION VERSION - Constraint Satisfaction + Detailed Blocker Reporting + Resource Management
+const SCRIPT_VERSION = "2026-02-06T13:30:00Z-PRODUCTION-V3";
 
 const { chromium } = require("playwright");
 
@@ -31,6 +31,10 @@ const HEADLESS = (process.env.HEALTH_HEADLESS || "true").toLowerCase() !== "fals
 const POST_ACTION_POLL_MS = Number(process.env.HEALTH_POST_ACTION_POLL_MS || 8000);
 const FORM_SUBMIT_WAIT_MS = Number(process.env.HEALTH_FORM_WAIT_MS || 15000);
 
+// NEW: Global timeout and concurrency limits
+const GLOBAL_TIMEOUT_MS = Number(process.env.HEALTH_GLOBAL_TIMEOUT_MS || 300000); // 5 minutes max per health check
+const MAX_CONCURRENT_CHECKS = Number(process.env.HEALTH_MAX_CONCURRENT || 2); // Max 2 health checks at once
+
 // Test identity
 const TEST_VALUES = {
   firstName: "Test",
@@ -60,6 +64,60 @@ const COMMON_CONTACT_PATHS = [
 const GENERIC_EVENTS = [
   "page_view", "user_engagement", "scroll", "session_start", "first_visit", "form_start"
 ];
+
+// NEW: Concurrency control
+let activeChecks = 0;
+const checkQueue = [];
+
+// ------------------------------
+// NEW: Concurrency Manager
+// ------------------------------
+async function acquireCheckSlot() {
+  if (activeChecks < MAX_CONCURRENT_CHECKS) {
+    activeChecks++;
+    logDebug("Health check slot acquired", { activeChecks, maxConcurrent: MAX_CONCURRENT_CHECKS });
+    return;
+  }
+
+  // Wait in queue
+  return new Promise((resolve) => {
+    checkQueue.push(resolve);
+    logDebug("Health check queued", { queueLength: checkQueue.length });
+  });
+}
+
+function releaseCheckSlot() {
+  activeChecks--;
+  logDebug("Health check slot released", { activeChecks, queueLength: checkQueue.length });
+  
+  if (checkQueue.length > 0) {
+    const next = checkQueue.shift();
+    activeChecks++;
+    next();
+  }
+}
+
+// ------------------------------
+// NEW: Global Timeout Wrapper
+// ------------------------------
+async function withTimeout(promise, timeoutMs, errorMessage) {
+  let timeoutId;
+  
+  const timeoutPromise = new Promise((_, reject) => {
+    timeoutId = setTimeout(() => {
+      reject(new Error(errorMessage || `Operation timed out after ${timeoutMs}ms`));
+    }, timeoutMs);
+  });
+
+  try {
+    const result = await Promise.race([promise, timeoutPromise]);
+    clearTimeout(timeoutId);
+    return result;
+  } catch (error) {
+    clearTimeout(timeoutId);
+    throw error;
+  }
+}
 
 // ------------------------------
 // Helpers
@@ -122,7 +180,11 @@ function nowIso() {
 
 async function safeWait(page, ms) {
   try {
-    await page.waitForTimeout(ms);
+    if (page) {
+      await page.waitForTimeout(ms);
+    } else {
+      await new Promise(resolve => setTimeout(resolve, ms));
+    }
   } catch {}
 }
 
@@ -1124,9 +1186,9 @@ async function testBestFirstPartyForm(page, beacons, pageUrl, formMeta) {
 }
 
 // ------------------------------
-// Main runner
+// NEW: Main runner with GUARANTEED cleanup
 // ------------------------------
-async function trackingHealthCheckSite(url) {
+async function trackingHealthCheckSiteInternal(url) {
   const startTs = nowIso();
   const targetUrl = normaliseUrl(url);
 
@@ -1162,51 +1224,57 @@ async function trackingHealthCheckSite(url) {
   };
 
   const beacons = [];
-
-  const browser = await chromium.launch({
-    headless: HEADLESS,
-    timeout: 90000,
-    args: ["--no-sandbox", "--disable-setuid-sandbox"]
-  });
-
-  const context = await browser.newContext();
-  const page = await context.newPage();
-
-  page.on("request", (request) => {
-    const reqUrl = request.url();
-    const type = classifyGaBeacon(reqUrl);
-
-    const lower = reqUrl.toLowerCase();
-    const relevant =
-      lower.includes("google-analytics.com") ||
-      lower.includes("googletagmanager.com") ||
-      lower.includes("analytics.google.com") ||
-      lower.includes("/g/collect") ||
-      lower.includes("/r/collect") ||
-      lower.includes("gtm.js") ||
-      lower.includes("gtag/js");
-
-    if (!relevant) return;
-
-    let eventName = null;
-    if (type === "GA4") {
-      eventName = parseEventNameFromUrl(reqUrl);
-      if (!eventName) {
-        const pd = request.postData();
-        eventName = parseEventNameFromPostData(pd);
-      }
-    }
-
-    beacons.push({
-      url: reqUrl,
-      timestamp: nowIso(),
-      type,
-      event_name: eventName
-    });
-  });
+  let browser = null;
+  let context = null;
+  let page = null;
 
   try {
     logInfo(`🔍 [${SCRIPT_VERSION}] Starting tracking health check`, { url: targetUrl });
+
+    browser = await chromium.launch({
+      headless: HEADLESS,
+      timeout: 90000,
+      args: ["--no-sandbox", "--disable-setuid-sandbox"]
+    });
+
+    context = await browser.newContext();
+    page = await context.newPage();
+
+    // Request listener with automatic cleanup
+    const requestHandler = (request) => {
+      const reqUrl = request.url();
+      const type = classifyGaBeacon(reqUrl);
+
+      const lower = reqUrl.toLowerCase();
+      const relevant =
+        lower.includes("google-analytics.com") ||
+        lower.includes("googletagmanager.com") ||
+        lower.includes("analytics.google.com") ||
+        lower.includes("/g/collect") ||
+        lower.includes("/r/collect") ||
+        lower.includes("gtm.js") ||
+        lower.includes("gtag/js");
+
+      if (!relevant) return;
+
+      let eventName = null;
+      if (type === "GA4") {
+        eventName = parseEventNameFromUrl(reqUrl);
+        if (!eventName) {
+          const pd = request.postData();
+          eventName = parseEventNameFromPostData(pd);
+        }
+      }
+
+      beacons.push({
+        url: reqUrl,
+        timestamp: nowIso(),
+        type,
+        event_name: eventName
+      });
+    };
+
+    page.on("request", requestHandler);
 
     const load = await safeGoto(page, targetUrl);
     if (!load.ok) throw new Error(load.error);
@@ -1393,9 +1461,110 @@ async function trackingHealthCheckSite(url) {
     results.evidence.network_beacons = beacons;
     return results;
   } finally {
-    try {
-      await browser.close();
-    } catch {}
+    // GUARANTEED CLEANUP - Multiple attempts
+    const cleanupStart = Date.now();
+    logDebug("Starting cleanup", { url: targetUrl });
+
+    // Remove request listener
+    if (page) {
+      try {
+        page.removeAllListeners("request");
+      } catch (e) {
+        logDebug("Failed to remove request listeners", { error: e.message });
+      }
+    }
+
+    // Close page
+    if (page) {
+      try {
+        await page.close({ timeout: 5000 }).catch(() => null);
+        logDebug("Page closed");
+      } catch (e) {
+        logDebug("Failed to close page", { error: e.message });
+      }
+    }
+
+    // Close context
+    if (context) {
+      try {
+        await context.close({ timeout: 5000 }).catch(() => null);
+        logDebug("Context closed");
+      } catch (e) {
+        logDebug("Failed to close context", { error: e.message });
+      }
+    }
+
+    // Close browser
+    if (browser) {
+      try {
+        await browser.close({ timeout: 10000 }).catch(() => null);
+        logDebug("Browser closed");
+      } catch (e) {
+        logDebug("Failed to close browser gracefully, forcing...", { error: e.message });
+        try {
+          // Force kill browser process
+          if (browser.process()) {
+            browser.process().kill('SIGKILL');
+          }
+        } catch (killErr) {
+          logDebug("Failed to force kill browser", { error: killErr.message });
+        }
+      }
+    }
+
+    const cleanupDuration = Date.now() - cleanupStart;
+    logDebug("Cleanup completed", { url: targetUrl, duration_ms: cleanupDuration });
+  }
+}
+
+// ------------------------------
+// NEW: Public API with timeout + concurrency
+// ------------------------------
+async function trackingHealthCheckSite(url) {
+  // Acquire concurrency slot
+  await acquireCheckSlot();
+  
+  try {
+    // Wrap with global timeout
+    const result = await withTimeout(
+      trackingHealthCheckSiteInternal(url),
+      GLOBAL_TIMEOUT_MS,
+      `Health check timed out after ${GLOBAL_TIMEOUT_MS}ms`
+    );
+    
+    return result;
+  } catch (error) {
+    // Timeout or other error
+    logInfo("❌ Health check failed or timed out", { url, error: error.message });
+    
+    return {
+      ok: false,
+      script_version: SCRIPT_VERSION,
+      url: normaliseUrl(url),
+      timestamp: nowIso(),
+      pages_visited: [],
+      cookie_consent: { banner_found: false, accepted: false, details: null },
+      tracking: {
+        tags_found: { gtm: [], ga4: [], ignored_aw: [] },
+        runtime: { gtm_loaded: false, ga_runtime_present: false },
+        beacon_counts: { gtm: 0, ga4: 0 },
+        has_tracking: false
+      },
+      ctas: {
+        phones: { found: 0, tested: 0, items: [] },
+        emails: { found: 0, tested: 0, items: [] }
+      },
+      forms: {
+        third_party_iframes_found: [],
+        pages: []
+      },
+      evidence: { network_beacons: [] },
+      issues: [`Global timeout or error: ${error.message}`],
+      site_status: "ERROR"
+    };
+  } finally {
+    // Always release concurrency slot
+    releaseCheckSlot();
   }
 }
 
