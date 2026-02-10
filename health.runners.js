@@ -1,6 +1,6 @@
 // /health.runners.js
-// PRODUCTION VERSION - Constraint Satisfaction + Detailed Blocker Reporting + Resource Management
-const SCRIPT_VERSION = "2026-02-06T13:30:00Z-PRODUCTION-V3";
+// PRODUCTION VERSION - Constraint Satisfaction + Detailed Blocker Reporting + Resource Management + Stealth Mode
+const SCRIPT_VERSION = "2026-02-06T18:00:00Z-PRODUCTION-V4";
 
 const { chromium } = require("playwright");
 
@@ -68,6 +68,13 @@ const GENERIC_EVENTS = [
 // NEW: Concurrency control
 let activeChecks = 0;
 const checkQueue = [];
+
+// ------------------------------
+// NEW: Random delay helper for human-like behavior
+// ------------------------------
+function randomDelay(min, max) {
+  return Math.floor(Math.random() * (max - min + 1)) + min;
+}
 
 // ------------------------------
 // NEW: Concurrency Manager
@@ -201,6 +208,30 @@ async function safeGoto(page, url) {
       return { ok: false, error: `Could not load page: ${e2.message}` };
     }
   }
+}
+
+// ------------------------------
+// NEW: Simulate human browsing behavior
+// ------------------------------
+async function simulateHumanBrowsing(page) {
+  try {
+    // Random scroll
+    await page.evaluate(() => {
+      window.scrollBy(0, Math.random() * 300);
+    });
+    await safeWait(null, randomDelay(500, 1000));
+    
+    // Random mouse movement
+    const viewport = page.viewportSize();
+    if (viewport) {
+      await page.mouse.move(
+        Math.random() * viewport.width,
+        Math.random() * viewport.height,
+        { steps: 10 }
+      );
+    }
+    await safeWait(null, randomDelay(300, 700));
+  } catch {}
 }
 
 // ------------------------------
@@ -604,26 +635,50 @@ async function pickBestFirstPartyFormOnPage(page, pageUrl) {
 }
 
 // ------------------------------
-// CONSTRAINT SATISFACTION: Smart field filling
+// CONSTRAINT SATISFACTION: Smart field filling WITH HUMAN-LIKE BEHAVIOR
 // ------------------------------
-async function fillFormFieldSmart(el, value, fieldType) {
+async function fillFormFieldSmart(page, el, value, fieldType) {
   try {
-    // Special handling for phone fields (masked inputs, lazy loading, etc.)
-    if (fieldType === 'phone') {
-      await el.focus().catch(() => null);
-      await safeWait(null, 100);
-      await el.clear().catch(() => null);
-      await el.type(value, { delay: 50 }).catch(() => null);
-      await el.blur().catch(() => null);
-      await safeWait(null, 100);
-      
-      const actualValue = await el.inputValue().catch(() => '');
-      return actualValue.replace(/\D/g, '').includes(value.replace(/\D/g, '').substring(0, 8));
+    // NEW: Human-like mouse movement to field
+    const box = await el.boundingBox().catch(() => null);
+    if (box) {
+      await page.mouse.move(
+        box.x + box.width / 2, 
+        box.y + box.height / 2,
+        { steps: 10 }
+      );
+      await safeWait(null, randomDelay(100, 300));
     }
     
-    // Standard fill for other fields
-    await el.fill(value, { timeout: 1200 }).catch(() => null);
-    await safeWait(null, 80);
+    // Click into field
+    await el.click();
+    await safeWait(null, randomDelay(200, 500));
+    
+    // Special handling for phone fields (masked inputs, lazy loading, etc.)
+    if (fieldType === 'phone') {
+      await el.clear().catch(() => null);
+      await safeWait(null, randomDelay(100, 200));
+      
+      // Type character by character with human-like delays
+      for (const char of value) {
+        await el.type(char, { delay: randomDelay(80, 200) });
+      }
+    } else {
+      // For other fields, type with variance
+      await el.clear().catch(() => null);
+      await safeWait(null, randomDelay(50, 150));
+      
+      // Type character by character with variance
+      for (const char of value) {
+        await el.type(char, { delay: randomDelay(50, 150) });
+      }
+    }
+    
+    // Random pause before blur (humans read what they typed)
+    await safeWait(null, randomDelay(300, 700));
+    
+    await el.blur();
+    await safeWait(null, randomDelay(100, 300));
     
     const actualValue = await el.inputValue().catch(() => '');
     return actualValue === value || actualValue.includes(value);
@@ -844,16 +899,16 @@ async function fixSubmissionBlockers(page, form, blockers) {
           }).catch(() => null);
           fixed = true;
         } else if (type === 'email') {
-          await fillFormFieldSmart(fieldEl, TEST_VALUES.email, 'email');
+          await fillFormFieldSmart(page, fieldEl, TEST_VALUES.email, 'email');
           fixed = true;
         } else if (type === 'tel') {
-          await fillFormFieldSmart(fieldEl, TEST_VALUES.phone, 'phone');
+          await fillFormFieldSmart(page, fieldEl, TEST_VALUES.phone, 'phone');
           fixed = true;
         } else if (tag === 'textarea') {
-          await fillFormFieldSmart(fieldEl, TEST_VALUES.message, 'textarea');
+          await fillFormFieldSmart(page, fieldEl, TEST_VALUES.message, 'textarea');
           fixed = true;
         } else {
-          await fillFormFieldSmart(fieldEl, TEST_VALUES.fullName, 'text');
+          await fillFormFieldSmart(page, fieldEl, TEST_VALUES.fullName, 'text');
           fixed = true;
         }
       }
@@ -892,7 +947,7 @@ async function testBestFirstPartyForm(page, beacons, pageUrl, formMeta) {
     }
 
     // ============================================
-    // PHASE 1: FILL ALL FIELDS
+    // PHASE 1: FILL ALL FIELDS WITH HUMAN-LIKE BEHAVIOR
     // ============================================
     for (let i = 0; i < fieldCount; i++) {
       const el = fields.nth(i);
@@ -909,6 +964,11 @@ async function testBestFirstPartyForm(page, beacons, pageUrl, formMeta) {
 
         const hay = `${type} ${name} ${id} ${placeholder} ${ariaLabel}`.toLowerCase();
         if (type.toLowerCase() === "hidden") continue;
+
+        // NEW: Random delay between fields (humans think/look around)
+        if (i > 0) {
+          await safeWait(page, randomDelay(500, 1500));
+        }
 
         if (tag === "select") {
           const did = await el.evaluate((sel) => {
@@ -933,19 +993,19 @@ async function testBestFirstPartyForm(page, beacons, pageUrl, formMeta) {
             await safeWait(page, 120);
           }
         } else if (tag === "textarea" || /message|enquir|inquir|comment/.test(hay)) {
-          await fillFormFieldSmart(el, TEST_VALUES.message, 'textarea');
+          await fillFormFieldSmart(page, el, TEST_VALUES.message, 'textarea');
         } else if (type.toLowerCase() === "email" || hay.includes("email")) {
-          await fillFormFieldSmart(el, TEST_VALUES.email, 'email');
+          await fillFormFieldSmart(page, el, TEST_VALUES.email, 'email');
         } else if (type.toLowerCase() === "tel" || hay.includes("phone") || hay.includes("tel")) {
-          await fillFormFieldSmart(el, TEST_VALUES.phone, 'phone');
+          await fillFormFieldSmart(page, el, TEST_VALUES.phone, 'phone');
         } else if (/first/.test(hay) && /name/.test(hay)) {
-          await fillFormFieldSmart(el, TEST_VALUES.firstName, 'text');
+          await fillFormFieldSmart(page, el, TEST_VALUES.firstName, 'text');
         } else if (/last/.test(hay) && /name/.test(hay)) {
-          await fillFormFieldSmart(el, TEST_VALUES.lastName, 'text');
+          await fillFormFieldSmart(page, el, TEST_VALUES.lastName, 'text');
         } else if (/name/.test(hay)) {
-          await fillFormFieldSmart(el, TEST_VALUES.fullName, 'text');
+          await fillFormFieldSmart(page, el, TEST_VALUES.fullName, 'text');
         } else if (!type || type.toLowerCase() === "text") {
-          await fillFormFieldSmart(el, TEST_VALUES.fullName, 'text');
+          await fillFormFieldSmart(page, el, TEST_VALUES.fullName, 'text');
         }
       } catch {}
     }
@@ -1231,14 +1291,44 @@ async function trackingHealthCheckSiteInternal(url) {
   try {
     logInfo(`🔍 [${SCRIPT_VERSION}] Starting tracking health check`, { url: targetUrl });
 
+    // NEW: Stealth browser launch
     browser = await chromium.launch({
       headless: HEADLESS,
       timeout: 90000,
-      args: ["--no-sandbox", "--disable-setuid-sandbox"]
+      args: [
+        "--no-sandbox", 
+        "--disable-setuid-sandbox",
+        "--disable-blink-features=AutomationControlled" // Hide automation
+      ]
     });
 
-    context = await browser.newContext();
+    // NEW: Human-like browser context
+    context = await browser.newContext({
+      viewport: { width: 1920, height: 1080 },
+      userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+      locale: 'en-GB',
+      timezoneId: 'Europe/London'
+    });
+
     page = await context.newPage();
+
+    // NEW: Hide webdriver flag and add human-like browser properties
+    await page.addInitScript(() => {
+      // Override the navigator.webdriver property
+      Object.defineProperty(navigator, 'webdriver', {
+        get: () => false
+      });
+      
+      // Mock plugins
+      Object.defineProperty(navigator, 'plugins', {
+        get: () => [1, 2, 3, 4, 5]
+      });
+      
+      // Mock languages
+      Object.defineProperty(navigator, 'languages', {
+        get: () => ['en-GB', 'en', 'en-US']
+      });
+    });
 
     // Request listener with automatic cleanup
     const requestHandler = (request) => {
@@ -1281,6 +1371,9 @@ async function trackingHealthCheckSiteInternal(url) {
     results.pages_visited.push(page.url());
 
     await safeWait(page, INIT_WAIT_MS);
+
+    // NEW: Simulate human browsing
+    await simulateHumanBrowsing(page);
 
     results.cookie_consent = await handleCookieConsent(page);
     await safeWait(page, 1200);
