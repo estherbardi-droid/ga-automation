@@ -22,7 +22,7 @@ function logDebug(msg, data = null) {
 // ------------------------------
 // Config
 // ------------------------------
-const MAX_PAGES_TO_VISIT = Number(process.env.HEALTH_MAX_PAGES || 10);
+const MAX_PAGES_TO_VISIT = Number(process.env.HEALTH_MAX_PAGES || 3);
 const MAX_PHONE_TESTS = Number(process.env.HEALTH_MAX_PHONE || 10);
 const MAX_EMAIL_TESTS = Number(process.env.HEALTH_MAX_EMAIL || 10);
 const NAV_TIMEOUT_MS = Number(process.env.HEALTH_NAV_TIMEOUT_MS || 45000);
@@ -584,7 +584,7 @@ async function pickBestFirstPartyFormOnPage(page, pageUrl) {
     return out;
   });
 
-  const best = formCandidates.find((f) => f.score >= 3) || null;
+  const best = formCandidates.find((f) => f.score >= 1) || formCandidates[0] || null;
   let bestIsThirdPartyByAction = false;
   if (best && best.action) {
     try {
@@ -951,7 +951,7 @@ async function testBestFirstPartyForm(page, beacons, pageUrl, formMeta) {
     }
 
     // Wait for JS validation
-    await safeWait(page, 800);
+    await safeWait(page, 1500);
 
     // ============================================
     // PHASE 2: FIND SUBMIT BUTTON
@@ -1013,7 +1013,7 @@ async function testBestFirstPartyForm(page, beacons, pageUrl, formMeta) {
       
       if (!fixed) break; // Can't fix anything
       
-      await safeWait(page, 500);
+      await safeWait(page, 1200);
       fixAttempts++;
     }
 
@@ -1408,6 +1408,11 @@ async function trackingHealthCheckSiteInternal(url) {
         note: formTest.note ?? null,
         debug_page_state: formTest.debug_page_state ?? null
       });
+
+      if (formTest.status === "PASS" || formTest.status === "FAIL") {
+        logInfo(`✅ Got definitive form result (${formTest.status}) on page ${i+1}/${pagesToVisit.length}, stopping crawl`);
+        break;
+      }
 
       await safeWait(page, 400);
     }
