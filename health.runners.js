@@ -1,6 +1,6 @@
 // /health.runners.js
-// PRODUCTION VERSION - Constraint Satisfaction + Detailed Blocker Reporting + Resource Management + Stealth Mode
-const SCRIPT_VERSION = "2026-02-06T18:00:00Z-PRODUCTION-V4";
+// PRODUCTION VERSION - Constraint Satisfaction + Detailed Blocker Reporting + Resource Management + Stealth Mode + Enhanced Lead Form Detection
+const SCRIPT_VERSION = "2026-02-11T12:00:00Z-PRODUCTION-V5";
 
 const { chromium } = require("playwright");
 
@@ -603,7 +603,7 @@ async function testLinkCTA(page, beacons, rawHref, type) {
 }
 
 // ------------------------------
-// Form detection
+// Form detection - ENHANCED WITH LEAD FORM FILTERING
 // ------------------------------
 async function pickBestFirstPartyFormOnPage(page, pageUrl) {
   const iframeInfos = await page.evaluate(() =>
@@ -667,20 +667,40 @@ async function pickBestFirstPartyFormOnPage(page, pageUrl) {
 
       const aroundText = textOf(f.closest("section") || f.closest("div") || f.parentElement);
       const hay = `${id} ${cls} ${aria} ${submitText} ${aroundText}`.toLowerCase();
+
+      // HARD EXCLUSION RULES: Detect search/filter/newsletter/login forms
+      const hasSearchInput = has(f, "input[type='search']") ||
+        Array.from(inputs).some((x) => {
+          const n = (attr(x, "name") || "").toLowerCase();
+          const id = (attr(x, "id") || "").toLowerCase();
+          const p = (attr(x, "placeholder") || "").toLowerCase();
+          return /^q$|^s$|search|keyword|make|model|postcode|price|min|max|sort|filter/i.test(n) ||
+                 /^q$|^s$|search|keyword|make|model|postcode|price|min|max|sort|filter/i.test(id) ||
+                 /^q$|^s$|search|keyword|make|model|postcode|price|min|max|sort|filter/i.test(p);
+        });
+
+      const searchLikeSubmit = /search|find|filter|apply|vehicles|inventory|results/i.test(submitText);
+      const isSiteSearch = (inputCount <= 2 && !hasEmail && !hasTextarea) && (hasSearchInput || searchLikeSubmit);
+      const isSearchLike = hasSearchInput || searchLikeSubmit || (/search/.test(hay) && inputCount <= 2);
       const isNewsletter = /newsletter|subscribe|subscription/.test(hay);
-      const isSearch = /search/.test(hay) && inputCount <= 2;
       const isLogin = /login|sign in|password/.test(hay);
 
       let score = 0;
-      if (hasEmail) score += 2;
+
+      // HARD EXCLUSIONS: Apply -999 penalty
+      if (isSearchLike) score -= 999;
+      if (isSiteSearch) score -= 999;
+      if (isNewsletter) score -= 999;
+      if (isLogin) score -= 999;
+
+      // LEAD FORM SIGNALS: Positive scoring
       if (hasTextarea) score += 3;
+      if (hasEmail && hasName) score += 3;
+      if (hasEmail) score += 2;
       if (hasName) score += 1;
       if (hasPhone) score += 1;
-      if (/send|submit|enquir|quote|request|book|contact/i.test(submitText)) score += 2;
-      if (/contact|get in touch|enquir|quote|estimate|book/i.test(hay)) score += 2;
-      if (isNewsletter) score -= 5;
-      if (isSearch) score -= 5;
-      if (isLogin) score -= 7;
+      if (/send|submit|enquir|request|get quote|book|contact|callback/i.test(submitText)) score += 2;
+      if (/contact|get in touch|enquir|quote|booking/i.test(hay)) score += 2;
 
       out.push({
         index: i,
@@ -699,7 +719,8 @@ async function pickBestFirstPartyFormOnPage(page, pageUrl) {
     return out;
   });
 
-  const best = formCandidates.find((f) => f.score >= 1) || formCandidates[0] || null;
+  // MINIMUM LEAD THRESHOLD: Only return forms with score >= 3
+  const best = formCandidates.find((f) => f.score >= 3) || null;
 
   let bestIsThirdPartyByAction = false;
   if (best && best.action) {
@@ -992,7 +1013,7 @@ async function fixSubmissionBlockers(page, form, blockers) {
 }
 
 // ------------------------------
-// Form fill + submit WITH CONSTRAINT SATISFACTION
+// Form fill + submit WITH CONSTRAINT SATISFACTION + IMPROVED SUCCESS DETECTION
 // ------------------------------
 async function testBestFirstPartyForm(page, beacons, pageUrl, formMeta) {
   if (!formMeta || !formMeta.best_form) {
@@ -1239,6 +1260,34 @@ async function testBestFirstPartyForm(page, beacons, pageUrl, formMeta) {
     const afterUrl = page.url();
     const urlChanged = afterUrl !== beforeUrl;
 
+    // IMPROVED SUCCESS DETECTION: Check for search/results page navigation
+    const searchResultsPatterns = [
+      /\/search/i,
+      /\/results/i,
+      /\/used-vehicles/i,
+      /\/vehicles/i,
+      /\/inventory/i,
+      /[?&]q=/i,
+      /[?&]search=/i,
+      /[?&]make=/i,
+      /[?&]model=/i,
+    ];
+
+    const navigatedToSearchResults = urlChanged && searchResultsPatterns.some(pattern => pattern.test(afterUrl));
+
+    // Thank you page patterns
+    const thankYouPatterns = [
+      /\/thank-you/i,
+      /\/thankyou/i,
+      /\/thanks/i,
+      /\/contact\/thanks/i,
+      /\/success/i,
+      /\/confirmation/i,
+      /\/submitted/i,
+    ];
+
+    const navigatedToThankYou = urlChanged && thankYouPatterns.some(pattern => pattern.test(afterUrl));
+
     const successSignal = await page
       .evaluate(() => {
         const text = (document.body?.innerText || "").toLowerCase();
@@ -1246,6 +1295,8 @@ async function testBestFirstPartyForm(page, beacons, pageUrl, formMeta) {
           text.includes("thank you") ||
           text.includes("thanks for") ||
           text.includes("message has been sent") ||
+          text.includes("message sent") ||
+          text.includes("we'll be in touch") ||
           text.includes("we will be in touch") ||
           text.includes("successfully sent") ||
           text.includes("submission successful") ||
@@ -1254,7 +1305,20 @@ async function testBestFirstPartyForm(page, beacons, pageUrl, formMeta) {
       })
       .catch(() => false);
 
-    const submittedSuccessfully = urlChanged || navigated || successSignal;
+    // Classify submission based on improved logic
+    let submittedSuccessfully = false;
+    let submissionType = null;
+
+    if (navigatedToSearchResults) {
+      submittedSuccessfully = false;
+      submissionType = "search_form";
+    } else if (navigatedToThankYou || successSignal) {
+      submittedSuccessfully = true;
+      submissionType = "lead_form";
+    } else if (urlChanged) {
+      submittedSuccessfully = true;
+      submissionType = "possible_lead_form";
+    }
 
     const newGa4 = beacons.slice(beforeBeaconIdx).filter((b) => b.type === "GA4");
 
@@ -1264,12 +1328,26 @@ async function testBestFirstPartyForm(page, beacons, pageUrl, formMeta) {
       return !GENERIC_EVENTS.some((generic) => eventName === generic);
     });
 
+    // If navigated to search results, classify as NOT_TESTED
+    if (navigatedToSearchResults) {
+      return {
+        status: "NOT_TESTED",
+        reason: "search_form_detected",
+        submittedSuccessfully: false,
+        submission_type: submissionType,
+        submit_evidence: { urlChanged, navigatedToSearchResults, beforeUrl, afterUrl },
+        ga4_events: uniq(newGa4.map((b) => b.event_name).filter(Boolean)),
+        note: "Form navigated to search/results page - classified as search form, not lead form",
+      };
+    }
+
     if (meaningfulEvents.length > 0) {
       return {
         status: "PASS",
         reason: null,
         submittedSuccessfully,
-        submit_evidence: { urlChanged, successSignal, navigated, beforeUrl, afterUrl },
+        submission_type: submissionType,
+        submit_evidence: { urlChanged, successSignal, navigated, navigatedToThankYou, beforeUrl, afterUrl },
         ga4_events: uniq(meaningfulEvents.map((b) => b.event_name).filter(Boolean)),
         evidence_urls: meaningfulEvents.slice(0, 5).map((b) => b.url),
       };
@@ -1281,7 +1359,8 @@ async function testBestFirstPartyForm(page, beacons, pageUrl, formMeta) {
         status: "FAIL",
         reason: "submitted_but_no_meaningful_ga4_event",
         submittedSuccessfully,
-        submit_evidence: { urlChanged, successSignal, navigated, beforeUrl, afterUrl },
+        submission_type: submissionType,
+        submit_evidence: { urlChanged, successSignal, navigated, navigatedToThankYou, beforeUrl, afterUrl },
         ga4_events: genericEventsSeen,
         note: "Form submitted successfully but only saw generic events. No conversion event fired.",
       };
@@ -1577,6 +1656,7 @@ async function trackingHealthCheckSiteInternal(url) {
         blockers: formTest.blockers || null,
         constraint_attempts: formTest.constraint_attempts || 0,
         submittedSuccessfully: formTest.submittedSuccessfully ?? null,
+        submission_type: formTest.submission_type ?? null,
         submit_evidence: formTest.submit_evidence ?? null,
         ga4_events: formTest.ga4_events ?? [],
         evidence_urls: formTest.evidence_urls ?? [],
@@ -1778,4 +1858,3 @@ async function trackingHealthCheckSite(url) {
 module.exports = {
   trackingHealthCheckSite,
 };
-
