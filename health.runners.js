@@ -1253,35 +1253,46 @@ async function trackingHealthCheckSiteInternal(url) {
   const targetUrl = normaliseUrl(url);
 
   const results = {
-    ok: true,
-    script_version: SCRIPT_VERSION,
-    url: targetUrl,
-    timestamp: startTs,
+  ok: true,
+  script_version: SCRIPT_VERSION,
+  url: targetUrl,
+  timestamp: startTs,
 
-    pages_visited: [],
-    cookie_consent: { banner_found: false, accepted: false, details: null },
+  // 🔽 ADD THESE TWO BLOCKS
+  health_bucket: null,
+  test_summary: {
+    total_items: 0,
+    passed_count: 0,
+    failed_count: 0,
+    not_tested_count: 0
+  },
+  // 🔼 END ADD
 
-    tracking: {
-      tags_found: { gtm: [], ga4: [], ignored_aw: [] },
-      runtime: { gtm_loaded: false, ga_runtime_present: false },
-      beacon_counts: { gtm: 0, ga4: 0 },
-      has_tracking: false
-    },
+  pages_visited: [],
+  cookie_consent: { banner_found: false, accepted: false, details: null },
 
-    ctas: {
-      phones: { found: 0, tested: 0, items: [] },
-      emails: { found: 0, tested: 0, items: [] }
-    },
+  tracking: {
+    tags_found: { gtm: [], ga4: [], ignored_aw: [] },
+    runtime: { gtm_loaded: false, ga_runtime_present: false },
+    beacon_counts: { gtm: 0, ga4: 0 },
+    has_tracking: false
+  },
 
-    forms: {
-      third_party_iframes_found: [],
-      pages: []
-    },
+  ctas: {
+    phones: { found: 0, tested: 0, items: [] },
+    emails: { found: 0, tested: 0, items: [] }
+  },
 
-    evidence: { network_beacons: [] },
-    issues: [],
-    site_status: "ERROR"
-  };
+  forms: {
+    third_party_iframes_found: [],
+    pages: []
+  },
+
+  evidence: { network_beacons: [] },
+  issues: [],
+  site_status: "ERROR"
+};
+
 
   const beacons = [];
   let browser = null;
@@ -1513,28 +1524,63 @@ async function trackingHealthCheckSiteInternal(url) {
     results.ctas.phones.found = allPhonesNorm.size;
     results.ctas.emails.found = allEmailsNorm.size;
 
-    const anyCtaPass =
-      results.ctas.phones.items.some((x) => x.status === "PASS") ||
-      results.ctas.emails.items.some((x) => x.status === "PASS");
+   const allItems = [
+  ...results.ctas.phones.items,
+  ...results.ctas.emails.items,
+  ...results.forms.pages
+];
 
-    const formPass = results.forms.pages.some((x) => x.status === "PASS");
-    const formFail = results.forms.pages.some((x) => x.status === "FAIL");
+const passCount = allItems.filter(x => x.status === "PASS").length;
+const failCount = allItems.filter(x => x.status === "FAIL").length;
+const notTestedCount = allItems.filter(x => x.status === "NOT_TESTED").length;
 
-    const ctaFail =
-      results.ctas.phones.items.some((x) => x.status === "FAIL") ||
-      results.ctas.emails.items.some((x) => x.status === "FAIL");
+const totalTestable = passCount + failCount;
+const totalItems = allItems.length;
 
-    const anyPass = anyCtaPass || formPass;
-    const anyFail = formFail || ctaFail;
+// expose counts for Lovable UI
+results.test_summary = {
+  total_items: totalItems,
+  passed_count: passCount,
+  failed_count: failCount,
+  not_tested_count: notTestedCount
+};
 
-    const allTestedPassed = anyPass && !anyFail;
-    const somePassSomeFail = anyPass && anyFail;
-    const trackingSetupButBroken = anyFail && !anyPass;
+// BUILD_REQUIRED: no tracking present at all
+if (!results.tracking.has_tracking) {
+  results.site_status = "BUILD_REQUIRED";
+  results.health_bucket = "BUILD_REQUIRED";
+}
 
-    if (allTestedPassed) results.site_status = "HEALTHY";
-    else if (somePassSomeFail) results.site_status = "PARTIAL";
-    else if (trackingSetupButBroken) results.site_status = "FAILED";
-    else results.site_status = "NOT_FULLY_TESTED";
+// NOT_TESTED: nothing could be tested (all NOT_TESTED)
+else if (totalItems > 0 && totalTestable === 0) {
+  results.site_status = "NOT_TESTED";
+  results.health_bucket = "NOT_TESTED";
+  results.issues.push("Nothing could be tested (CAPTCHA / constraints / third-party forms)");
+}
+
+// FAIL: tracking exists but nothing fired
+else if (totalTestable > 0 && passCount === 0 && failCount > 0) {
+  results.site_status = "FAIL";
+  results.health_bucket = "FAIL";
+}
+
+// OK: tracking exists and ALL tested items fired
+else if (totalTestable > 0 && passCount === totalTestable) {
+  results.site_status = "OK";
+  results.health_bucket = "OK";
+}
+
+// WARN: tracking exists and MOST fired (some failed)
+else if (totalTestable > 0 && passCount > 0 && failCount > 0) {
+  results.site_status = "WARN";
+  results.health_bucket = "WARN";
+}
+
+// fallback
+else {
+  results.site_status = "NOT_TESTED";
+  results.health_bucket = "NOT_TESTED";
+}
 
     if (formFail) results.issues.push("At least one form submitted but no meaningful GA4 event fired");
     if (ctaFail) results.issues.push("At least one CTA click produced no meaningful GA4 beacon");
