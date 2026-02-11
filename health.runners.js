@@ -1294,10 +1294,15 @@ async function trackingHealthCheckSiteInternal(url) {
 };
 
 
-  const beacons = [];
-  let browser = null;
-  let context = null;
-  let page = null;
+ const beacons = [];
+let browser = null;
+let context = null;
+let page = null;
+
+// ADD THESE
+let formFail = false;  // Case A: form submitted but no GA4 conversion
+let ctaFail = false;   // CTA clicked but no GA4 conversion
+
 
   try {
     logInfo(`🔍 [${SCRIPT_VERSION}] Starting tracking health check`, { url: targetUrl });
@@ -1452,6 +1457,10 @@ async function trackingHealthCheckSiteInternal(url) {
         }
       }
 
+      if (item.status === "FAIL") {
+  ctaFail = true;
+}
+
       for (const rawMail of ctas.emails || []) {
         const norm = normaliseMailtoHref(rawMail);
         if (!norm) continue;
@@ -1477,6 +1486,9 @@ async function trackingHealthCheckSiteInternal(url) {
           });
         }
       }
+      if (item.status === "FAIL") {
+  ctaFail = true;
+}
 
       const formMeta = await pickBestFirstPartyFormOnPage(page, actualUrl);
 
@@ -1512,6 +1524,13 @@ async function trackingHealthCheckSiteInternal(url) {
         note: formTest.note ?? null,
         debug_page_state: formTest.debug_page_state ?? null
       });
+
+      // ADD THIS
+if (formTest.status === "FAIL" && formTest.reason === "submitted_but_no_meaningful_ga4_event") {
+  formFail = true; // Case A only
+}
+
+
 
       if (formTest.status === "PASS" || formTest.status === "FAIL") {
         logInfo(`✅ Got definitive form result (${formTest.status}) on page ${i+1}/${pagesToVisit.length}, stopping crawl`);
