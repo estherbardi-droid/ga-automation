@@ -973,23 +973,44 @@ async function fillFormFieldSmart(page, element, fieldInfo) {
 // ------------------------------
 // CAPTCHA DETECTION
 // ------------------------------
-async function detectCaptcha(page) {
+async function detectCaptcha(page, formLocator = null) {
   try {
-    if (await page.locator('.g-recaptcha, iframe[src*="recaptcha/api2"]').count()) {
-      return { detected: true, type: "reCAPTCHA v2", bypassable: false };
+    // If we have a form locator, check CAPTCHA inside the form
+    const searchScope = formLocator || page;
+    
+    // Check for reCAPTCHA v2 - must be VISIBLE
+    const recaptchaElements = await searchScope.locator('.g-recaptcha, iframe[src*="recaptcha/api2"]').all();
+    for (const elem of recaptchaElements) {
+      const isVisible = await elem.isVisible().catch(() => false);
+      if (isVisible) {
+        return { detected: true, type: "reCAPTCHA v2", bypassable: false };
+      }
     }
     
-    const hasRecaptchaV3 = await page.evaluate(() => typeof window.grecaptcha !== "undefined").catch(() => false);
-    if (hasRecaptchaV3) {
-      return { detected: true, type: "reCAPTCHA v3 (invisible)", bypassable: true };
+    // Check for reCAPTCHA v3 (invisible) - only if we're checking the whole page
+    if (!formLocator) {
+      const hasRecaptchaV3 = await page.evaluate(() => typeof window.grecaptcha !== "undefined").catch(() => false);
+      if (hasRecaptchaV3) {
+        return { detected: true, type: "reCAPTCHA v3 (invisible)", bypassable: true };
+      }
     }
     
-    if (await page.locator('.h-captcha, iframe[src*="hcaptcha"]').count()) {
-      return { detected: true, type: "hCaptcha", bypassable: false };
+    // Check for hCaptcha - must be VISIBLE
+    const hcaptchaElements = await searchScope.locator('.h-captcha, iframe[src*="hcaptcha"]').all();
+    for (const elem of hcaptchaElements) {
+      const isVisible = await elem.isVisible().catch(() => false);
+      if (isVisible) {
+        return { detected: true, type: "hCaptcha", bypassable: false };
+      }
     }
     
-    if (await page.locator('[class*="cf-turnstile"], iframe[src*="turnstile"]').count()) {
-      return { detected: true, type: "Cloudflare Turnstile", bypassable: false };
+    // Check for Cloudflare Turnstile - must be VISIBLE
+    const turnstileElements = await searchScope.locator('[class*="cf-turnstile"], iframe[src*="turnstile"]').all();
+    for (const elem of turnstileElements) {
+      const isVisible = await elem.isVisible().catch(() => false);
+      if (isVisible) {
+        return { detected: true, type: "Cloudflare Turnstile", bypassable: false };
+      }
     }
   } catch {}
   
@@ -1006,18 +1027,11 @@ async function detectSubmissionBlockers(page, form, submitButton) {
     requiredCheckboxesUnchecked: [],
     requiredRadiosUnselected: [],
     validationErrors: [],
-    captcha: { detected: false, type: null },
   };
 
   try {
     blockers.submitDisabled = await submitButton.isDisabled().catch(() => false);
   } catch {}
-
-  // Check for CAPTCHA
-  const captchaInfo = await detectCaptcha(page);
-  if (captchaInfo.detected) {
-    blockers.captcha = captchaInfo;
-  }
 
   // Required fields
   try {
@@ -1285,20 +1299,14 @@ async function testFirstPartyForm(page, beacons, pageUrl, formMeta) {
       const blockers = await detectSubmissionBlockers(page, form, submit);
       finalBlockers = blockers;
 
-      // Check if form is submittable
+      // Check if form is submittable (ignoring CAPTCHA for now - we'll try to submit anyway)
       if (
         !blockers.submitDisabled &&
         blockers.requiredFieldsEmpty.length === 0 &&
         blockers.requiredCheckboxesUnchecked.length === 0 &&
-        blockers.requiredRadiosUnselected.length === 0 &&
-        (!blockers.captcha.detected || blockers.captcha.bypassable)
+        blockers.requiredRadiosUnselected.length === 0
       ) {
         isSubmittable = true;
-        break;
-      }
-
-      // If CAPTCHA detected and not bypassable, stop
-      if (blockers.captcha.detected && !blockers.captcha.bypassable) {
         break;
       }
 
@@ -1310,15 +1318,10 @@ async function testFirstPartyForm(page, beacons, pageUrl, formMeta) {
       fixAttempts++;
     }
 
-    // If not submittable, return detailed blocker info
+    // If not submittable due to regular constraints, return detailed blocker info
     if (!isSubmittable) {
       const blockerDetails = [];
 
-      if (finalBlockers?.captcha?.detected && !finalBlockers?.captcha?.bypassable) {
-        blockerDetails.push(
-          `CAPTCHA detected (${finalBlockers.captcha.type}) - cannot be bypassed by automation`
-        );
-      }
       if (finalBlockers?.submitDisabled) {
         blockerDetails.push("Submit button is disabled");
       }
@@ -1485,6 +1488,18 @@ async function testFirstPartyForm(page, beacons, pageUrl, formMeta) {
     }
 
     // Validation blocked or submit not confirmed
+    // NOW check if CAPTCHA was the blocker
+    const captchaCheck = await detectCaptcha(page, form);
+    
+    if (captchaCheck.detected && !captchaCheck.bypassable) {
+      return {
+        status: "NOT_TESTED",
+        reason: `CAPTCHA detected (${captchaCheck.type}) - cannot be bypassed by automation`,
+        submittedSuccessfully: false,
+        blockers: { captcha: captchaCheck }
+      };
+    }
+    
     const validationText = await page.evaluate(() => {
       const els = Array.from(
         document.querySelectorAll(
@@ -1798,6 +1813,31 @@ async function trackingHealthCheckSiteInternal(url) {
     // Handle cookie consent
     results.cookie_consent = await handleCookieConsent(page);
     await safeWait(page, 1200);
+
+    // Wait for GTM/GA4 to load (up to 10 seconds)
+    const trackingLoadTimeout = 10000;
+    const trackingCheckStart = Date.now();
+    let trackingLoaded = false;
+    
+    while (Date.now() - trackingCheckStart < trackingLoadTimeout && !trackingLoaded) {
+      const hasTracking = await page.evaluate(() => {
+        // Check if GTM or GA4 is present
+        const hasGTM = !!window.google_tag_manager || 
+                       document.querySelector('script[src*="googletagmanager.com/gtm.js"]') !== null;
+        const hasGA4 = !!window.gtag || 
+                       !!window.dataLayer || 
+                       document.querySelector('script[src*="googletagmanager.com/gtag/js"]') !== null;
+        return hasGTM || hasGA4;
+      }).catch(() => false);
+      
+      if (hasTracking) {
+        trackingLoaded = true;
+        logDebug("Tracking codes loaded", { timeWaited: Date.now() - trackingCheckStart });
+        await safeWait(page, 1000); // Extra wait for tracking to initialize
+      } else {
+        await safeWait(page, 500);
+      }
+    }
 
     // Detect tracking
     const tracking = await detectTrackingSetup(page, beacons);
