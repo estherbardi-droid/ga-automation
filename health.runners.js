@@ -1315,7 +1315,9 @@ async function testFirstPartyForm(page, beacons, pageUrl, formMeta) {
       const blockerDetails = [];
 
       if (finalBlockers?.captcha?.detected && !finalBlockers?.captcha?.bypassable) {
-        blockerDetails.push(`CAPTCHA detected (${finalBlockers.captcha.type}) - cannot be bypassed by automation`);
+        blockerDetails.push(
+          `CAPTCHA detected (${finalBlockers.captcha.type}) - cannot be bypassed by automation`
+        );
       }
       if (finalBlockers?.submitDisabled) {
         blockerDetails.push("Submit button is disabled");
@@ -2031,8 +2033,45 @@ async function trackingHealthCheckSiteInternal(url) {
       cat => categoryStatus[cat] === "AT_LEAST_ONE_PASSED"
     );
 
-    // RULE: If ANY category present completely failed → FAIL
-    if (categoriesAllFailed.length > 0) {
+    // PRIORITY 1: If ANY category present is completely NOT_TESTED → NOT_TESTED
+    // This takes priority over partial passes in other categories
+    if (categoriesNotTested.length > 0) {
+      results.overall_status = "NOT_TESTED";
+      results.why = "Critical CTAs could not be tested due to technical blockers";
+      
+      // List which categories couldn't be tested
+      categoriesNotTested.forEach(cat => {
+        if (cat === "phones") {
+          const reasons = uniq(results.ctas.phones.items.map(i => i.reason).filter(Boolean));
+          results.needs_improvement.push(`Phone CTAs not testable: ${reasons.join("; ")}`);
+        } else if (cat === "emails") {
+          const reasons = uniq(results.ctas.emails.items.map(i => i.reason).filter(Boolean));
+          results.needs_improvement.push(`Email CTAs not testable: ${reasons.join("; ")}`);
+        } else if (cat === "forms") {
+          const reasons = uniq(allFormResults.filter(f => f.status === "NOT_TESTED").map(f => f.reason).filter(Boolean));
+          results.needs_improvement.push(`Forms not testable: ${reasons.slice(0, 3).join("; ")}`);
+        }
+      });
+
+      // Also mention categories that did pass (for context)
+      categoriesWithAtLeastOnePass.forEach(cat => {
+        if (cat === "phones") {
+          results.needs_improvement.push(
+            `Note: ${results.ctas.phones.passed} out of ${results.ctas.phones.tested} phone CTAs did pass`
+          );
+        } else if (cat === "emails") {
+          results.needs_improvement.push(
+            `Note: ${results.ctas.emails.passed} out of ${results.ctas.emails.tested} email CTAs did pass`
+          );
+        } else if (cat === "forms") {
+          results.needs_improvement.push(
+            `Note: ${formsPassed} out of ${formsTested} forms did pass`
+          );
+        }
+      });
+    }
+    // PRIORITY 2: If ANY category present completely failed → FAIL
+    else if (categoriesAllFailed.length > 0) {
       results.overall_status = "FAIL";
       results.why = `${categoriesAllFailed.map(cat => cat.charAt(0).toUpperCase() + cat.slice(1)).join(", ")} category completely failed - no CTAs tracking properly`;
       
@@ -2053,25 +2092,7 @@ async function trackingHealthCheckSiteInternal(url) {
         }
       });
     }
-    // RULE: If ALL categories present are NOT_TESTED → NOT_TESTED
-    else if (categoriesPresent.length > 0 && categoriesNotTested.length === categoriesPresent.length) {
-      results.overall_status = "NOT_TESTED";
-      results.why = "All CTAs could not be tested due to technical blockers";
-      
-      categoriesNotTested.forEach(cat => {
-        if (cat === "phones") {
-          const reasons = uniq(results.ctas.phones.items.map(i => i.reason).filter(Boolean));
-          results.needs_improvement.push(`Phone CTAs not testable: ${reasons.join("; ")}`);
-        } else if (cat === "emails") {
-          const reasons = uniq(results.ctas.emails.items.map(i => i.reason).filter(Boolean));
-          results.needs_improvement.push(`Email CTAs not testable: ${reasons.join("; ")}`);
-        } else if (cat === "forms") {
-          const reasons = uniq(allFormResults.filter(f => f.status === "NOT_TESTED").map(f => f.reason).filter(Boolean));
-          results.needs_improvement.push(`Forms not testable: ${reasons.slice(0, 3).join("; ")}`);
-        }
-      });
-    }
-    // RULE: If ALL categories present have at least one pass → PASS
+    // PRIORITY 3: If ALL categories present have at least one pass → PASS
     else if (categoriesPresent.length > 0 && categoriesWithAtLeastOnePass.length === categoriesPresent.length) {
       results.overall_status = "PASS";
       results.why = "All CTA categories have at least one working conversion event";
@@ -2096,19 +2117,10 @@ async function trackingHealthCheckSiteInternal(url) {
         );
       }
     }
-    // Mixed scenario
+    // Fallback
     else {
-      if (categoriesWithAtLeastOnePass.length > 0) {
-        results.overall_status = "PASS";
-        results.why = "Some CTA categories working, others could not be tested";
-        
-        categoriesNotTested.forEach(cat => {
-          results.needs_improvement.push(`${cat.charAt(0).toUpperCase() + cat.slice(1)} CTAs could not be tested`);
-        });
-      } else {
-        results.overall_status = "NOT_TESTED";
-        results.why = "No CTAs could be successfully tested";
-      }
+      results.overall_status = "NOT_TESTED";
+      results.why = "No CTAs could be successfully tested";
     }
 
     results.evidence.network_beacons = beacons;
