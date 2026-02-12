@@ -1,8 +1,11 @@
-// /health.runners.js
-// PRODUCTION VERSION - Constraint Satisfaction + Detailed Blocker Reporting + Resource Management + Stealth Mode + Enhanced Lead Form Detection
-const SCRIPT_VERSION = "2026-02-11T12:00:00Z-PRODUCTION-V5";
+// /health-check-v6.js
+// INTELLIGENT TRACKING HEALTH CHECK - Complete Rewrite
+// Features: Smart form detection, constraint satisfaction, third-party fallback, detailed reporting
+const SCRIPT_VERSION = "2026-02-12T18:00:00Z-V6-INTELLIGENT";
 
 const { chromium } = require("playwright");
+const fs = require("fs").promises;
+const path = require("path");
 
 /**
  * Logging
@@ -20,7 +23,7 @@ function logDebug(msg, data = null) {
 }
 
 // ------------------------------
-// Config
+// Configuration
 // ------------------------------
 const MAX_PAGES_TO_VISIT = Number(process.env.HEALTH_MAX_PAGES || 3);
 const MAX_PHONE_TESTS = Number(process.env.HEALTH_MAX_PHONE || 10);
@@ -30,10 +33,8 @@ const INIT_WAIT_MS = Number(process.env.HEALTH_INIT_WAIT_MS || 3500);
 const HEADLESS = (process.env.HEALTH_HEADLESS || "true").toLowerCase() !== "false";
 const POST_ACTION_POLL_MS = Number(process.env.HEALTH_POST_ACTION_POLL_MS || 8000);
 const FORM_SUBMIT_WAIT_MS = Number(process.env.HEALTH_FORM_WAIT_MS || 15000);
-
-// NEW: Global timeout and concurrency limits
-const GLOBAL_TIMEOUT_MS = Number(process.env.HEALTH_GLOBAL_TIMEOUT_MS || 300000); // 5 minutes max per health check
-const MAX_CONCURRENT_CHECKS = Number(process.env.HEALTH_MAX_CONCURRENT || 2); // Max 2 health checks at once
+const GLOBAL_TIMEOUT_MS = Number(process.env.HEALTH_GLOBAL_TIMEOUT_MS || 300000);
+const MAX_CONCURRENT_CHECKS = Number(process.env.HEALTH_MAX_CONCURRENT || 2);
 
 // Test identity
 const TEST_VALUES = {
@@ -42,28 +43,25 @@ const TEST_VALUES = {
   fullName: "Test User",
   email: process.env.HEALTH_TEST_EMAIL || "test+healthcheck@example.com",
   phone: process.env.HEALTH_TEST_PHONE || "07123456789",
-  message:
-    process.env.HEALTH_TEST_MESSAGE ||
-    "Tracking health check test submission. Please ignore.",
+  message: process.env.HEALTH_TEST_MESSAGE || "Tracking health check test submission. Please ignore.",
+  company: "Test Company Ltd",
+  postcode: "SW1A 1AA",
+  city: "London",
+  address: "123 Test Street",
+  subject: "General Enquiry",
 };
 
-// Third-party providers to skip
-const THIRD_PARTY_HINTS = [
-  "hubspot",
-  "hsforms",
-  "jotform",
-  "typeform",
-  "google.com/forms",
-  "forms.gle",
-  "calendly",
-  "marketo",
-  "pardot",
-  "salesforce",
-  "formstack",
-  "wufoo",
-  "cognitoforms",
+// Generic events that don't count as conversions
+const GENERIC_EVENTS = [
+  "page_view",
+  "user_engagement",
+  "scroll",
+  "session_start",
+  "first_visit",
+  "form_start",
 ];
 
+// Contact page keywords
 const CONTACT_PAGE_KEYWORDS = [
   "contact",
   "get-in-touch",
@@ -94,86 +92,34 @@ const COMMON_CONTACT_PATHS = [
   "/booking",
 ];
 
-const GENERIC_EVENTS = [
-  "page_view",
-  "user_engagement",
-  "scroll",
-  "session_start",
-  "first_visit",
-  "form_start",
+// Third-party form providers
+const THIRD_PARTY_HINTS = [
+  "hubspot",
+  "hsforms",
+  "jotform",
+  "typeform",
+  "google.com/forms",
+  "forms.gle",
+  "calendly",
+  "marketo",
+  "pardot",
+  "salesforce",
+  "formstack",
+  "wufoo",
+  "cognitoforms",
 ];
 
-// NEW: Concurrency control
+// Concurrency control
 let activeChecks = 0;
 const checkQueue = [];
 
 // ------------------------------
-// NEW: Random delay helper for human-like behavior
+// Utility Functions
 // ------------------------------
 function randomDelay(min, max) {
   return Math.floor(Math.random() * (max - min + 1)) + min;
 }
 
-// ------------------------------
-// NEW: Concurrency Manager
-// ------------------------------
-async function acquireCheckSlot() {
-  if (activeChecks < MAX_CONCURRENT_CHECKS) {
-    activeChecks++;
-    logDebug("Health check slot acquired", {
-      activeChecks,
-      maxConcurrent: MAX_CONCURRENT_CHECKS,
-    });
-    return;
-  }
-
-  return new Promise((resolve) => {
-    checkQueue.push(resolve);
-    logDebug("Health check queued", { queueLength: checkQueue.length });
-  });
-}
-
-function releaseCheckSlot() {
-  activeChecks--;
-  logDebug("Health check slot released", {
-    activeChecks,
-    queueLength: checkQueue.length,
-  });
-
-  if (checkQueue.length > 0) {
-    const next = checkQueue.shift();
-    activeChecks++;
-    next();
-  }
-}
-
-// ------------------------------
-// NEW: Global Timeout Wrapper
-// ------------------------------
-async function withTimeout(promise, timeoutMs, errorMessage) {
-  let timeoutId;
-
-  const timeoutPromise = new Promise((_, reject) => {
-    timeoutId = setTimeout(() => {
-      reject(
-        new Error(errorMessage || `Operation timed out after ${timeoutMs}ms`)
-      );
-    }, timeoutMs);
-  });
-
-  try {
-    const result = await Promise.race([promise, timeoutPromise]);
-    clearTimeout(timeoutId);
-    return result;
-  } catch (error) {
-    clearTimeout(timeoutId);
-    throw error;
-  }
-}
-
-// ------------------------------
-// Helpers
-// ------------------------------
 function normaliseUrl(input) {
   if (!input) return null;
   let u = input.trim();
@@ -262,7 +208,59 @@ async function safeGoto(page, url) {
 }
 
 // ------------------------------
-// NEW: Simulate human browsing behavior
+// Concurrency Management
+// ------------------------------
+async function acquireCheckSlot() {
+  if (activeChecks < MAX_CONCURRENT_CHECKS) {
+    activeChecks++;
+    logDebug("Health check slot acquired", {
+      activeChecks,
+      maxConcurrent: MAX_CONCURRENT_CHECKS,
+    });
+    return;
+  }
+
+  return new Promise((resolve) => {
+    checkQueue.push(resolve);
+    logDebug("Health check queued", { queueLength: checkQueue.length });
+  });
+}
+
+function releaseCheckSlot() {
+  activeChecks--;
+  logDebug("Health check slot released", {
+    activeChecks,
+    queueLength: checkQueue.length,
+  });
+
+  if (checkQueue.length > 0) {
+    const next = checkQueue.shift();
+    activeChecks++;
+    next();
+  }
+}
+
+async function withTimeout(promise, timeoutMs, errorMessage) {
+  let timeoutId;
+
+  const timeoutPromise = new Promise((_, reject) => {
+    timeoutId = setTimeout(() => {
+      reject(new Error(errorMessage || `Operation timed out after ${timeoutMs}ms`));
+    }, timeoutMs);
+  });
+
+  try {
+    const result = await Promise.race([promise, timeoutPromise]);
+    clearTimeout(timeoutId);
+    return result;
+  } catch (error) {
+    clearTimeout(timeoutId);
+    throw error;
+  }
+}
+
+// ------------------------------
+// Human Behavior Simulation
 // ------------------------------
 async function simulateHumanBrowsing(page) {
   try {
@@ -284,7 +282,7 @@ async function simulateHumanBrowsing(page) {
 }
 
 // ------------------------------
-// Cookie consent
+// Cookie Consent
 // ------------------------------
 async function handleCookieConsent(page) {
   const out = { banner_found: false, accepted: false, details: null };
@@ -348,7 +346,7 @@ async function handleCookieConsent(page) {
 }
 
 // ------------------------------
-// Try to expand mobile/hidden menus
+// Menu Expansion
 // ------------------------------
 async function tryExpandMenus(page) {
   const menuSelectors = [
@@ -377,7 +375,7 @@ async function tryExpandMenus(page) {
 }
 
 // ------------------------------
-// Detect tracking setup
+// Tracking Detection
 // ------------------------------
 async function detectTrackingSetup(page, beacons) {
   const tagData = await page.evaluate(() => {
@@ -424,7 +422,7 @@ async function detectTrackingSetup(page, beacons) {
 }
 
 // ------------------------------
-// Discover candidate pages
+// Page Discovery
 // ------------------------------
 async function discoverCandidatePages(page, baseUrl) {
   const origin = safeUrlObj(baseUrl)?.origin || null;
@@ -490,7 +488,7 @@ async function discoverCandidatePages(page, baseUrl) {
 }
 
 // ------------------------------
-// CTA scan
+// CTA Scanning
 // ------------------------------
 async function scanCTAsOnPage(page) {
   return await page.evaluate(() => {
@@ -519,7 +517,7 @@ function escapeAttrValue(v) {
 }
 
 // ------------------------------
-// CTA test
+// CTA Testing
 // ------------------------------
 async function testLinkCTA(page, beacons, rawHref, type) {
   const before = beacons.length;
@@ -533,7 +531,7 @@ async function testLinkCTA(page, beacons, rawHref, type) {
   try {
     const loc = page.locator(selector).first();
     if (!(await loc.count())) {
-      return { status: "NOT_TESTED", reason: "cta_not_found_on_page", beacons_delta: 0 };
+      return { status: "NOT_TESTED", reason: "CTA not found on page", beacons_delta: 0 };
     }
 
     try {
@@ -558,7 +556,7 @@ async function testLinkCTA(page, beacons, rawHref, type) {
     } catch (scrollErr) {
       return {
         status: "NOT_TESTED",
-        reason: `element_interaction_failed: ${scrollErr.message}`,
+        reason: `Element interaction failed: ${scrollErr.message}`,
         beacons_delta: 0,
       };
     }
@@ -589,35 +587,54 @@ async function testLinkCTA(page, beacons, rawHref, type) {
 
     return {
       status: "FAIL",
-      reason: genericEventsSeen.length ? "only_generic_events_fired" : "no_ga4_beacon_after_click",
+      reason: genericEventsSeen.length
+        ? "Only generic events fired (no conversion event)"
+        : "No GA4 beacon fired after click",
       beacons_delta: beacons.length - before,
       generic_events_seen: genericEventsSeen,
     };
   } catch (e) {
     return {
       status: "NOT_TESTED",
-      reason: `cta_test_error: ${e.message}`,
+      reason: `CTA test error: ${e.message}`,
       beacons_delta: 0,
     };
   }
 }
 
 // ------------------------------
-// Form detection - ENHANCED WITH LEAD FORM FILTERING
+// INTELLIGENT FORM DETECTION
 // ------------------------------
-async function pickBestFirstPartyFormOnPage(page, pageUrl) {
-  const iframeInfos = await page.evaluate(() =>
-    Array.from(document.querySelectorAll("iframe"))
-      .map((f) => (f.getAttribute("src") || "").trim())
-      .filter(Boolean)
-  );
-  const thirdPartyIframes = iframeInfos.filter((src) =>
-    containsAny(src.toLowerCase(), THIRD_PARTY_HINTS)
-  );
+async function discoverAllFormsOnPage(page, pageUrl) {
+  // Detect dynamic forms by scrolling and clicking triggers
+  await page.evaluate(() => {
+    window.scrollTo(0, document.body.scrollHeight);
+  });
+  await safeWait(page, 1500);
 
-  const formCandidates = await page.evaluate(() => {
+  const triggers = [
+    'button:has-text("Contact")',
+    'button:has-text("Enquire")',
+    'a:has-text("Get in touch")',
+    '[class*="modal-trigger"]',
+    '[class*="popup-trigger"]',
+  ];
+
+  for (const trigger of triggers) {
+    try {
+      const btn = page.locator(trigger).first();
+      if (await btn.count() && await btn.isVisible({ timeout: 500 })) {
+        await btn.click({ timeout: 1500 }).catch(() => null);
+        await safeWait(page, 1000);
+      }
+    } catch {}
+  }
+
+  // Discover all forms
+  const formCandidates = await page.evaluate((pageUrl) => {
     const forms = Array.from(document.querySelectorAll("form"));
     const out = [];
+
     function textOf(el) {
       return (el?.textContent || "").replace(/\s+/g, " ").trim().slice(0, 400);
     }
@@ -653,6 +670,7 @@ async function pickBestFirstPartyFormOnPage(page, pageUrl) {
         const p = (attr(x, "placeholder") || "").toLowerCase();
         return n.includes("name") || p.includes("name");
       });
+      const hasFileUpload = has(f, "input[type='file']");
 
       const submitText = (() => {
         const btn =
@@ -668,32 +686,32 @@ async function pickBestFirstPartyFormOnPage(page, pageUrl) {
       const aroundText = textOf(f.closest("section") || f.closest("div") || f.parentElement);
       const hay = `${id} ${cls} ${aria} ${submitText} ${aroundText}`.toLowerCase();
 
-      // HARD EXCLUSION RULES: Detect search/filter/newsletter/login forms
+      // Detect search/filter forms
       const hasSearchInput = has(f, "input[type='search']") ||
         Array.from(inputs).some((x) => {
           const n = (attr(x, "name") || "").toLowerCase();
           const id = (attr(x, "id") || "").toLowerCase();
           const p = (attr(x, "placeholder") || "").toLowerCase();
-          return /^q$|^s$|search|keyword|make|model|postcode|price|min|max|sort|filter/i.test(n) ||
-                 /^q$|^s$|search|keyword|make|model|postcode|price|min|max|sort|filter/i.test(id) ||
-                 /^q$|^s$|search|keyword|make|model|postcode|price|min|max|sort|filter/i.test(p);
+          return /^q$|^s$|search|keyword|make|model|postcode|price|min|max|sort|filter|year|mileage|transmission/i.test(n) ||
+                 /^q$|^s$|search|keyword|make|model|postcode|price|min|max|sort|filter|year|mileage|transmission/i.test(id) ||
+                 /^q$|^s$|search|keyword|make|model|postcode|price|min|max|sort|filter|year|mileage|transmission/i.test(p);
         });
 
-      const searchLikeSubmit = /search|find|filter|apply|vehicles|inventory|results/i.test(submitText);
+      const searchLikeSubmit = /search|find|filter|apply|vehicles|inventory|results|view\s+stock/i.test(submitText);
       const isSiteSearch = (inputCount <= 2 && !hasEmail && !hasTextarea) && (hasSearchInput || searchLikeSubmit);
-      const isSearchLike = hasSearchInput || searchLikeSubmit || (/search/.test(hay) && inputCount <= 2);
-      const isNewsletter = /newsletter|subscribe|subscription/.test(hay);
+      const isSearchLike = hasSearchInput || searchLikeSubmit || (/search/.test(hay) && inputCount <= 3 && !hasEmail);
+      const isNewsletter = /newsletter|subscribe|subscription/.test(hay) && !hasTextarea;
       const isLogin = /login|sign in|password/.test(hay);
 
       let score = 0;
 
-      // HARD EXCLUSIONS: Apply -999 penalty
+      // Hard exclusions
       if (isSearchLike) score -= 999;
       if (isSiteSearch) score -= 999;
       if (isNewsletter) score -= 999;
       if (isLogin) score -= 999;
 
-      // LEAD FORM SIGNALS: Positive scoring
+      // Lead form signals
       if (hasTextarea) score += 3;
       if (hasEmail && hasName) score += 3;
       if (hasEmail) score += 2;
@@ -701,6 +719,24 @@ async function pickBestFirstPartyFormOnPage(page, pageUrl) {
       if (hasPhone) score += 1;
       if (/send|submit|enquir|request|get quote|book|contact|callback/i.test(submitText)) score += 2;
       if (/contact|get in touch|enquir|quote|booking/i.test(hay)) score += 2;
+
+      // Check if third-party by action
+      let isThirdPartyByAction = false;
+      if (action) {
+        try {
+          const actionUrl = new URL(action, pageUrl);
+          const pageOrigin = new URL(pageUrl).origin;
+          const actionLower = actionUrl.href.toLowerCase();
+          const thirdPartyHints = [
+            "hubspot", "hsforms", "jotform", "typeform", "google.com/forms",
+            "forms.gle", "calendly", "marketo", "pardot", "salesforce",
+            "formstack", "wufoo", "cognitoforms"
+          ];
+          if (actionUrl.origin !== pageOrigin && thirdPartyHints.some(hint => actionLower.includes(hint))) {
+            isThirdPartyByAction = true;
+          }
+        } catch {}
+      }
 
       out.push({
         index: i,
@@ -710,79 +746,258 @@ async function pickBestFirstPartyFormOnPage(page, pageUrl) {
         hasTextarea,
         hasPhone,
         hasName,
+        hasFileUpload,
         submitText,
         score,
+        isThirdPartyByAction,
       });
     }
 
-    out.sort((a, b) => b.score - a.score || b.inputCount - a.inputCount);
     return out;
-  });
+  }, pageUrl);
 
-  // MINIMUM LEAD THRESHOLD: Only return forms with score >= 3
-  const best = formCandidates.find((f) => f.score >= 3) || null;
+  // Filter for lead forms only (score >= 3)
+  const leadForms = formCandidates.filter(f => f.score >= 3);
 
-  let bestIsThirdPartyByAction = false;
-  if (best && best.action) {
-    try {
-      const actionUrl = new URL(best.action, pageUrl);
-      const pageOrigin = new URL(pageUrl).origin;
-      const actionLower = actionUrl.href.toLowerCase();
-      if (actionUrl.origin !== pageOrigin && containsAny(actionLower, THIRD_PARTY_HINTS)) {
-        bestIsThirdPartyByAction = true;
-      }
-    } catch {}
-  }
+  // Sort by score
+  leadForms.sort((a, b) => b.score - a.score || b.inputCount - a.inputCount);
+
+  // Classify as first-party or third-party
+  const firstPartyForms = leadForms.filter(f => !f.isThirdPartyByAction);
+  const thirdPartyForms = leadForms.filter(f => f.isThirdPartyByAction);
+
+  // Check for third-party iframes
+  const iframeInfos = await page.evaluate(() =>
+    Array.from(document.querySelectorAll("iframe"))
+      .map((f) => (f.getAttribute("src") || "").trim())
+      .filter(Boolean)
+  );
+  const thirdPartyIframes = iframeInfos.filter((src) =>
+    containsAny(src.toLowerCase(), THIRD_PARTY_HINTS)
+  );
 
   return {
-    third_party_iframes: thirdPartyIframes,
-    best_form: best ? { ...best, third_party_by_action: bestIsThirdPartyByAction } : null,
+    firstPartyForms,
+    thirdPartyForms,
+    thirdPartyIframes,
+    totalLeadForms: leadForms.length,
+    totalFormsScanned: formCandidates.length,
   };
 }
 
 // ------------------------------
-// CONSTRAINT SATISFACTION: Smart field filling WITH HUMAN-LIKE BEHAVIOR
+// INTELLIGENT FIELD DETECTION & FILLING
 // ------------------------------
-async function fillFormFieldSmart(page, el, value, fieldType) {
+async function detectFieldType(element, page) {
   try {
-    const box = await el.boundingBox().catch(() => null);
+    const tag = await element.evaluate((el) => el.tagName.toLowerCase());
+    const type = (await element.getAttribute("type")) || "";
+    const name = (await element.getAttribute("name")) || "";
+    const id = (await element.getAttribute("id")) || "";
+    const placeholder = (await element.getAttribute("placeholder")) || "";
+    const ariaLabel = (await element.getAttribute("aria-label")) || "";
+    
+    // Try to find associated label
+    const labelText = await element.evaluate((el) => {
+      const label = el.closest("label") || (el.id ? document.querySelector(`label[for="${el.id}"]`) : null);
+      return label ? (label.textContent || "").trim().toLowerCase() : "";
+    });
+
+    const combined = `${type} ${name} ${id} ${placeholder} ${ariaLabel} ${labelText}`.toLowerCase();
+
+    if (tag === "select") return { type: "select", tag };
+    if (type === "checkbox") return { type: "checkbox", tag };
+    if (type === "radio") return { type: "radio", tag };
+    if (type === "file") return { type: "file", tag };
+    if (type === "date") return { type: "date", tag };
+    if (type === "hidden") return { type: "hidden", tag };
+
+    if (/email|e-mail/.test(combined)) return { type: "email", tag };
+    if (/phone|tel|mobile|cell/.test(combined)) return { type: "phone", tag };
+    if (/first.*name|fname|forename/.test(combined)) return { type: "first_name", tag };
+    if (/last.*name|lname|surname/.test(combined)) return { type: "last_name", tag };
+    if (/^name$|full.*name|your.*name/.test(combined)) return { type: "full_name", tag };
+    if (/message|comment|enquiry|inquiry|question|details/.test(combined)) return { type: "message", tag };
+    if (/company|organisation|organization|business/.test(combined)) return { type: "company", tag };
+    if (/postcode|postal|zip/.test(combined)) return { type: "postcode", tag };
+    if (/address/.test(combined)) return { type: "address", tag };
+    if (/city|town/.test(combined)) return { type: "city", tag };
+    if (/country/.test(combined)) return { type: "country", tag };
+    if (/subject|topic|regarding/.test(combined)) return { type: "subject", tag };
+    if (tag === "textarea") return { type: "message", tag };
+
+    return { type: "text", tag };
+  } catch {
+    return { type: "unknown", tag: "unknown" };
+  }
+}
+
+async function fillFormFieldSmart(page, element, fieldInfo) {
+  try {
+    const { type, tag } = fieldInfo;
+
+    // Skip hidden fields
+    if (type === "hidden") return { success: true, skipped: true };
+
+    // Check if visible and enabled
+    const isVisible = await element.isVisible({ timeout: 500 }).catch(() => false);
+    const isEnabled = await element.isEnabled({ timeout: 500 }).catch(() => false);
+    
+    if (!isVisible || !isEnabled) {
+      return { success: true, skipped: true, reason: "not_visible_or_disabled" };
+    }
+
+    // Move mouse to field (human-like)
+    const box = await element.boundingBox().catch(() => null);
     if (box) {
-      await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2, {
-        steps: 10,
-      });
+      await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2, { steps: 10 });
       await safeWait(null, randomDelay(100, 300));
     }
 
-    await el.click();
-    await safeWait(null, randomDelay(200, 500));
+    // SELECT dropdowns
+    if (tag === "select") {
+      const selected = await element.evaluate((sel) => {
+        const options = Array.from(sel.querySelectorAll("option"));
+        const validOptions = options.filter((opt) => {
+          const value = opt.value?.trim();
+          const text = opt.textContent?.trim().toLowerCase();
+          if (!value || value === "" || value === "0") return false;
+          if (text.includes("select") || text.includes("choose") || text.includes("--")) return false;
+          return true;
+        });
+        if (validOptions.length > 0) {
+          sel.value = validOptions[0].value;
+          sel.dispatchEvent(new Event("change", { bubbles: true }));
+          return validOptions[0].value;
+        }
+        return null;
+      });
+      return { success: !!selected, value: selected };
+    }
 
-    if (fieldType === "phone") {
-      await el.clear().catch(() => null);
-      await safeWait(null, randomDelay(100, 200));
-      for (const char of value) {
-        await el.type(char, { delay: randomDelay(80, 200) });
+    // CHECKBOXES
+    if (type === "checkbox") {
+      const name = await element.getAttribute("name") || "";
+      const id = await element.getAttribute("id") || "";
+      const combined = `${name} ${id}`.toLowerCase();
+      
+      // Only check if it's consent/privacy/terms related
+      if (/consent|agree|privacy|terms|gdpr|policy|accept/.test(combined)) {
+        await element.check({ timeout: 1500 }).catch(() => null);
+        await safeWait(page, randomDelay(100, 300));
+        return { success: true };
       }
-    } else {
-      await el.clear().catch(() => null);
-      await safeWait(null, randomDelay(50, 150));
-      for (const char of value) {
-        await el.type(char, { delay: randomDelay(50, 150) });
+      return { success: true, skipped: true, reason: "non_consent_checkbox" };
+    }
+
+    // RADIO BUTTONS
+    if (type === "radio") {
+      const name = await element.getAttribute("name");
+      if (name) {
+        const firstInGroup = page.locator(`input[type="radio"][name="${name}"]`).first();
+        await firstInGroup.check({ timeout: 1500 }).catch(() => null);
+        await safeWait(page, randomDelay(100, 300));
+        return { success: true };
+      }
+      return { success: false, reason: "radio_no_name" };
+    }
+
+    // FILE UPLOAD
+    if (type === "file") {
+      try {
+        // Create a dummy text file
+        const tmpDir = "/tmp";
+        const dummyPath = path.join(tmpDir, "health-check-test.txt");
+        await fs.writeFile(dummyPath, "This is a test file for form submission validation.");
+        await element.setInputFiles(dummyPath);
+        await safeWait(page, randomDelay(200, 400));
+        return { success: true };
+      } catch (fileErr) {
+        return { success: false, reason: `file_upload_failed: ${fileErr.message}` };
       }
     }
 
+    // DATE INPUTS
+    if (type === "date") {
+      await element.click();
+      await safeWait(page, randomDelay(200, 400));
+      await element.fill("2025-06-15").catch(() => null);
+      await safeWait(page, randomDelay(100, 300));
+      return { success: true };
+    }
+
+    // TEXT INPUTS (email, phone, name, message, etc.)
+    const valueMap = {
+      email: TEST_VALUES.email,
+      phone: TEST_VALUES.phone,
+      first_name: TEST_VALUES.firstName,
+      last_name: TEST_VALUES.lastName,
+      full_name: TEST_VALUES.fullName,
+      message: TEST_VALUES.message,
+      company: TEST_VALUES.company,
+      postcode: TEST_VALUES.postcode,
+      city: TEST_VALUES.city,
+      address: TEST_VALUES.address,
+      subject: TEST_VALUES.subject,
+      text: TEST_VALUES.fullName,
+    };
+
+    const value = valueMap[type] || TEST_VALUES.fullName;
+
+    await element.click();
+    await safeWait(null, randomDelay(200, 500));
+
+    // Clear first
+    await element.clear().catch(() => null);
+    await safeWait(null, randomDelay(50, 150));
+
+    // Type with realistic delays
+    const delay = type === "phone" ? randomDelay(80, 200) : randomDelay(50, 150);
+    for (const char of value) {
+      await element.type(char, { delay: randomDelay(50, 150) });
+    }
+
     await safeWait(null, randomDelay(300, 700));
-    await el.blur();
+    await element.blur();
     await safeWait(null, randomDelay(100, 300));
 
-    const actualValue = await el.inputValue().catch(() => "");
-    return actualValue === value || actualValue.includes(value);
-  } catch {
-    return false;
+    const actualValue = await element.inputValue().catch(() => "");
+    const success = actualValue === value || actualValue.includes(value);
+    
+    return { success, value: actualValue };
+  } catch (err) {
+    return { success: false, reason: err.message };
   }
 }
 
 // ------------------------------
-// CONSTRAINT SATISFACTION: Detect blockers
+// CAPTCHA DETECTION
+// ------------------------------
+async function detectCaptcha(page) {
+  try {
+    if (await page.locator('.g-recaptcha, iframe[src*="recaptcha/api2"]').count()) {
+      return { detected: true, type: "reCAPTCHA v2", bypassable: false };
+    }
+    
+    const hasRecaptchaV3 = await page.evaluate(() => typeof window.grecaptcha !== "undefined").catch(() => false);
+    if (hasRecaptchaV3) {
+      return { detected: true, type: "reCAPTCHA v3 (invisible)", bypassable: true };
+    }
+    
+    if (await page.locator('.h-captcha, iframe[src*="hcaptcha"]').count()) {
+      return { detected: true, type: "hCaptcha", bypassable: false };
+    }
+    
+    if (await page.locator('[class*="cf-turnstile"], iframe[src*="turnstile"]').count()) {
+      return { detected: true, type: "Cloudflare Turnstile", bypassable: false };
+    }
+  } catch {}
+  
+  return { detected: false, type: null, bypassable: false };
+}
+
+// ------------------------------
+// CONSTRAINT SATISFACTION - Detect Blockers
 // ------------------------------
 async function detectSubmissionBlockers(page, form, submitButton) {
   const blockers = {
@@ -791,38 +1006,31 @@ async function detectSubmissionBlockers(page, form, submitButton) {
     requiredCheckboxesUnchecked: [],
     requiredRadiosUnselected: [],
     validationErrors: [],
-    captchaDetected: false,
-    captchaType: null,
+    captcha: { detected: false, type: null },
   };
 
   try {
     blockers.submitDisabled = await submitButton.isDisabled().catch(() => false);
   } catch {}
 
-  try {
-    if (await page.locator('.g-recaptcha, iframe[src*="recaptcha"]').count()) {
-      blockers.captchaDetected = true;
-      blockers.captchaType = "reCAPTCHA v2";
-    } else if (await page.evaluate(() => typeof window.grecaptcha !== "undefined").catch(() => false)) {
-      blockers.captchaDetected = true;
-      blockers.captchaType = "reCAPTCHA v3 (invisible)";
-    } else if (await page.locator('.h-captcha, iframe[src*="hcaptcha"]').count()) {
-      blockers.captchaDetected = true;
-      blockers.captchaType = "hCaptcha";
-    } else if (await page.locator('[class*="cf-turnstile"], iframe[src*="turnstile"]').count()) {
-      blockers.captchaDetected = true;
-      blockers.captchaType = "Cloudflare Turnstile";
-    }
-  } catch {}
+  // Check for CAPTCHA
+  const captchaInfo = await detectCaptcha(page);
+  if (captchaInfo.detected) {
+    blockers.captcha = captchaInfo;
+  }
 
+  // Required fields
   try {
     const requiredFields = await form
       .locator("input[required], textarea[required], select[required]")
       .all();
+    
     for (const field of requiredFields) {
       const value = await field.inputValue().catch(() => "");
       const isVisible = await field.isVisible().catch(() => false);
-      if (isVisible && !value) {
+      const tag = await field.evaluate(el => el.tagName.toLowerCase());
+      
+      if (isVisible && !value && tag !== "select") {
         const name = await field.getAttribute("name").catch(() => "");
         const id = await field.getAttribute("id").catch(() => "");
         const type = await field.getAttribute("type").catch(() => "");
@@ -832,27 +1040,39 @@ async function detectSubmissionBlockers(page, form, submitButton) {
           type,
           placeholder: placeholder || "",
         });
+      } else if (isVisible && tag === "select") {
+        const selectedValue = await field.evaluate(sel => sel.value);
+        if (!selectedValue || selectedValue === "" || selectedValue === "0") {
+          const name = await field.getAttribute("name").catch(() => "");
+          const id = await field.getAttribute("id").catch(() => "");
+          blockers.requiredFieldsEmpty.push({
+            name: name || id || "unknown",
+            type: "select",
+            placeholder: "",
+          });
+        }
       }
     }
   } catch {}
 
+  // Required checkboxes
   try {
     const requiredCheckboxes = await form
       .locator('input[type="checkbox"][required]')
       .all();
+    
     for (const checkbox of requiredCheckboxes) {
       const isChecked = await checkbox.isChecked().catch(() => false);
       const isVisible = await checkbox.isVisible().catch(() => false);
+      
       if (isVisible && !isChecked) {
         const name = await checkbox.getAttribute("name").catch(() => "");
         const id = await checkbox.getAttribute("id").catch(() => "");
-        const label = await checkbox
-          .evaluate((el) => {
-            const labelEl =
-              el.closest("label") || (el.id ? document.querySelector(`label[for="${el.id}"]`) : null);
-            return labelEl ? (labelEl.textContent || "").trim().substring(0, 100) : "";
-          })
-          .catch(() => "");
+        const label = await checkbox.evaluate((el) => {
+          const labelEl = el.closest("label") || (el.id ? document.querySelector(`label[for="${el.id}"]`) : null);
+          return labelEl ? (labelEl.textContent || "").trim().substring(0, 100) : "";
+        }).catch(() => "");
+        
         blockers.requiredCheckboxesUnchecked.push({
           name: name || id || "unknown",
           label,
@@ -861,6 +1081,7 @@ async function detectSubmissionBlockers(page, form, submitButton) {
     }
   } catch {}
 
+  // Required radio groups
   try {
     const radioGroups = new Map();
     const radios = await form.locator('input[type="radio"][required]').all();
@@ -878,13 +1099,10 @@ async function detectSubmissionBlockers(page, form, submitButton) {
       if (isChecked) radioGroups.get(name).hasSelection = true;
 
       if (!radioGroups.get(name).label) {
-        const label = await radio
-          .evaluate((el) => {
-            const labelEl =
-              el.closest("label") || (el.id ? document.querySelector(`label[for="${el.id}"]`) : null);
-            return labelEl ? (labelEl.textContent || "").trim().substring(0, 100) : "";
-          })
-          .catch(() => "");
+        const label = await radio.evaluate((el) => {
+          const labelEl = el.closest("label") || (el.id ? document.querySelector(`label[for="${el.id}"]`) : null);
+          return labelEl ? (labelEl.textContent || "").trim().substring(0, 100) : "";
+        }).catch(() => "");
         radioGroups.get(name).label = label;
       }
     }
@@ -903,6 +1121,7 @@ async function detectSubmissionBlockers(page, form, submitButton) {
     }
   } catch {}
 
+  // Validation errors
   try {
     const errorSelectors = [
       '[role="alert"]',
@@ -930,11 +1149,12 @@ async function detectSubmissionBlockers(page, form, submitButton) {
 }
 
 // ------------------------------
-// CONSTRAINT SATISFACTION: Fix blockers
+// CONSTRAINT SATISFACTION - Fix Blockers
 // ------------------------------
 async function fixSubmissionBlockers(page, form, blockers) {
   let fixed = false;
 
+  // Fix required checkboxes
   for (const checkbox of blockers.requiredCheckboxesUnchecked) {
     try {
       const checkboxName = typeof checkbox === "string" ? checkbox : checkbox.name;
@@ -944,25 +1164,27 @@ async function fixSubmissionBlockers(page, form, blockers) {
         )
         .first();
       if (await checkboxEl.count()) {
-        await checkboxEl.check({ timeout: 1000 }).catch(() => null);
-        await safeWait(page, 100);
+        await checkboxEl.check({ timeout: 1500 }).catch(() => null);
+        await safeWait(page, 150);
         fixed = true;
       }
     } catch {}
   }
 
+  // Fix required radio buttons
   for (const radio of blockers.requiredRadiosUnselected) {
     try {
       const radioName = typeof radio === "string" ? radio : radio.name;
       const firstRadio = form.locator(`input[type="radio"][name="${radioName}"]`).first();
       if (await firstRadio.count()) {
-        await firstRadio.check({ timeout: 1000 }).catch(() => null);
-        await safeWait(page, 100);
+        await firstRadio.check({ timeout: 1500 }).catch(() => null);
+        await safeWait(page, 150);
         fixed = true;
       }
     } catch {}
   }
 
+  // Fix required fields
   for (const field of blockers.requiredFieldsEmpty) {
     try {
       const fieldEl = form
@@ -970,41 +1192,11 @@ async function fixSubmissionBlockers(page, form, blockers) {
           `input[name="${field.name}"], input[id="${field.name}"], select[name="${field.name}"], select[id="${field.name}"], textarea[name="${field.name}"], textarea[id="${field.name}"]`
         )
         .first();
+      
       if (await fieldEl.count()) {
-        const tag = await fieldEl.evaluate((el) => el.tagName.toLowerCase()).catch(() => "");
-        const type = (field.type || "").toLowerCase();
-
-        if (tag === "select") {
-          await fieldEl
-            .evaluate((sel) => {
-              const options = Array.from(sel.querySelectorAll("option"));
-              const candidate = options.find((o) => {
-                const v = (o.getAttribute("value") || "").trim();
-                const t = (o.textContent || "").trim().toLowerCase();
-                if (!v) return false;
-                if (t.includes("select") || t.includes("choose")) return false;
-                return true;
-              });
-              if (candidate) {
-                sel.value = candidate.value;
-                sel.dispatchEvent(new Event("change", { bubbles: true }));
-              }
-            })
-            .catch(() => null);
-          fixed = true;
-        } else if (type === "email") {
-          await fillFormFieldSmart(page, fieldEl, TEST_VALUES.email, "email");
-          fixed = true;
-        } else if (type === "tel") {
-          await fillFormFieldSmart(page, fieldEl, TEST_VALUES.phone, "phone");
-          fixed = true;
-        } else if (tag === "textarea") {
-          await fillFormFieldSmart(page, fieldEl, TEST_VALUES.message, "textarea");
-          fixed = true;
-        } else {
-          await fillFormFieldSmart(page, fieldEl, TEST_VALUES.fullName, "text");
-          fixed = true;
-        }
+        const fieldInfo = await detectFieldType(fieldEl, page);
+        const result = await fillFormFieldSmart(page, fieldEl, fieldInfo);
+        if (result.success) fixed = true;
       }
     } catch {}
   }
@@ -1013,95 +1205,46 @@ async function fixSubmissionBlockers(page, form, blockers) {
 }
 
 // ------------------------------
-// Form fill + submit WITH CONSTRAINT SATISFACTION + IMPROVED SUCCESS DETECTION
+// TEST FIRST-PARTY FORM
 // ------------------------------
-async function testBestFirstPartyForm(page, beacons, pageUrl, formMeta) {
-  if (!formMeta || !formMeta.best_form) {
-    return { status: "NOT_TESTED", reason: "no_first_party_form_found" };
-  }
-  if (formMeta.best_form.third_party_by_action) {
-    return { status: "NOT_TESTED", reason: "third_party_form_action" };
-  }
-
-  const formIndex = formMeta.best_form.index;
+async function testFirstPartyForm(page, beacons, pageUrl, formMeta) {
+  const formIndex = formMeta.index;
   const form = page.locator("form").nth(formIndex);
 
   try {
     if (!(await form.count())) {
-      return { status: "NOT_TESTED", reason: "form_locator_not_found" };
+      return { status: "NOT_TESTED", reason: "Form element not found on page" };
     }
 
-    await form.scrollIntoViewIfNeeded().catch(() => null);
-    await safeWait(page, 400);
+    await form.scrollIntoViewIfNeeded({ timeout: 3000 }).catch(() => null);
+    await safeWait(page, 500);
 
+    // PHASE 1: Fill all fields
     const fields = form.locator("input, textarea, select");
     const fieldCount = await fields.count();
+
     if (fieldCount < 2) {
-      return { status: "NOT_TESTED", reason: "form_too_small" };
+      return { status: "NOT_TESTED", reason: "Form has less than 2 fields (likely not a lead form)" };
     }
 
-    // PHASE 1: Fill
+    logDebug(`Filling form with ${fieldCount} fields`, { pageUrl, formIndex });
+
     for (let i = 0; i < fieldCount; i++) {
-      const el = fields.nth(i);
-      try {
-        if (!(await el.isVisible({ timeout: 300 }))) continue;
-        if (!(await el.isEnabled({ timeout: 300 }))) continue;
+      const field = fields.nth(i);
+      
+      if (i > 0) {
+        await safeWait(page, randomDelay(500, 1500)); // Human-like delay between fields
+      }
 
-        const tag = await el.evaluate((n) => n.tagName.toLowerCase());
-        const type = (await el.getAttribute("type")) || "";
-        const name = (await el.getAttribute("name")) || "";
-        const id = (await el.getAttribute("id")) || "";
-        const placeholder = (await el.getAttribute("placeholder")) || "";
-        const ariaLabel = (await el.getAttribute("aria-label")) || "";
-
-        const hay = `${type} ${name} ${id} ${placeholder} ${ariaLabel}`.toLowerCase();
-        if (type.toLowerCase() === "hidden") continue;
-
-        if (i > 0) await safeWait(page, randomDelay(500, 1500));
-
-        if (tag === "select") {
-          const did = await el.evaluate((sel) => {
-            const options = Array.from(sel.querySelectorAll("option"));
-            const candidate = options.find((o) => {
-              const v = (o.getAttribute("value") || "").trim();
-              const t = (o.textContent || "").trim().toLowerCase();
-              if (!v) return false;
-              if (t.includes("select") || t.includes("choose")) return false;
-              return true;
-            });
-            if (!candidate) return false;
-            sel.value = candidate.value;
-            sel.dispatchEvent(new Event("change", { bubbles: true }));
-            return true;
-          });
-          if (did) await safeWait(page, 120);
-        } else if (type.toLowerCase() === "checkbox") {
-          const shouldTick = /consent|agree|privacy|terms|gdpr|policy/.test(hay);
-          if (shouldTick) {
-            await el.check({ timeout: 1000 }).catch(() => null);
-            await safeWait(page, 120);
-          }
-        } else if (tag === "textarea" || /message|enquir|inquir|comment/.test(hay)) {
-          await fillFormFieldSmart(page, el, TEST_VALUES.message, "textarea");
-        } else if (type.toLowerCase() === "email" || hay.includes("email")) {
-          await fillFormFieldSmart(page, el, TEST_VALUES.email, "email");
-        } else if (type.toLowerCase() === "tel" || hay.includes("phone") || hay.includes("tel")) {
-          await fillFormFieldSmart(page, el, TEST_VALUES.phone, "phone");
-        } else if (/first/.test(hay) && /name/.test(hay)) {
-          await fillFormFieldSmart(page, el, TEST_VALUES.firstName, "text");
-        } else if (/last/.test(hay) && /name/.test(hay)) {
-          await fillFormFieldSmart(page, el, TEST_VALUES.lastName, "text");
-        } else if (/name/.test(hay)) {
-          await fillFormFieldSmart(page, el, TEST_VALUES.fullName, "text");
-        } else if (!type || type.toLowerCase() === "text") {
-          await fillFormFieldSmart(page, el, TEST_VALUES.fullName, "text");
-        }
-      } catch {}
+      const fieldInfo = await detectFieldType(field, page);
+      const result = await fillFormFieldSmart(page, field, fieldInfo);
+      
+      logDebug(`Field ${i + 1}/${fieldCount}:`, { type: fieldInfo.type, success: result.success });
     }
 
     await safeWait(page, 1500);
 
-    // PHASE 2: Find submit
+    // PHASE 2: Find submit button
     const submitCandidates = [
       "button[type='submit']",
       "input[type='submit']",
@@ -1127,9 +1270,12 @@ async function testBestFirstPartyForm(page, beacons, pageUrl, formMeta) {
         }
       } catch {}
     }
-    if (!submit) return { status: "NOT_TESTED", reason: "no_submit_button_found" };
 
-    // PHASE 3: Constraint loop
+    if (!submit) {
+      return { status: "NOT_TESTED", reason: "No submit button found in form" };
+    }
+
+    // PHASE 3: Constraint satisfaction loop (max 3 attempts)
     const MAX_FIX_ATTEMPTS = 3;
     let fixAttempts = 0;
     let isSubmittable = false;
@@ -1139,58 +1285,59 @@ async function testBestFirstPartyForm(page, beacons, pageUrl, formMeta) {
       const blockers = await detectSubmissionBlockers(page, form, submit);
       finalBlockers = blockers;
 
+      // Check if form is submittable
       if (
         !blockers.submitDisabled &&
         blockers.requiredFieldsEmpty.length === 0 &&
         blockers.requiredCheckboxesUnchecked.length === 0 &&
         blockers.requiredRadiosUnselected.length === 0 &&
-        !blockers.captchaDetected
+        (!blockers.captcha.detected || blockers.captcha.bypassable)
       ) {
         isSubmittable = true;
         break;
       }
 
+      // If CAPTCHA detected and not bypassable, stop
+      if (blockers.captcha.detected && !blockers.captcha.bypassable) {
+        break;
+      }
+
+      // Try to fix blockers
       const fixed = await fixSubmissionBlockers(page, form, blockers);
-      if (!fixed) break;
+      if (!fixed) break; // No more fixes possible
 
       await safeWait(page, 1200);
       fixAttempts++;
     }
 
+    // If not submittable, return detailed blocker info
     if (!isSubmittable) {
       const blockerDetails = [];
 
-      if (finalBlockers?.captchaDetected) {
-        blockerDetails.push(
-          `CAPTCHA detected (${finalBlockers.captchaType}) - cannot be bypassed by automation`
-        );
+      if (finalBlockers?.captcha?.detected && !finalBlockers?.captcha?.bypassable) {
+        blockerDetails.push(`CAPTCHA detected (${finalBlockers.captcha.type}) - cannot be bypassed by automation`);
       }
-      if (finalBlockers?.submitDisabled) blockerDetails.push("Submit button is disabled");
-
+      if (finalBlockers?.submitDisabled) {
+        blockerDetails.push("Submit button is disabled");
+      }
       if (finalBlockers?.requiredFieldsEmpty?.length > 0) {
         blockerDetails.push(
           `Required fields not filled (${finalBlockers.requiredFieldsEmpty.length}): ${finalBlockers.requiredFieldsEmpty
-            .map(
-              (f) =>
-                `${f.name} (${f.type}${f.placeholder ? ": " + f.placeholder : ""})`
-            )
+            .map(f => `${f.name} (${f.type}${f.placeholder ? ": " + f.placeholder : ""})`)
             .join(", ")}`
         );
       }
       if (finalBlockers?.requiredCheckboxesUnchecked?.length > 0) {
         blockerDetails.push(
           `Required checkboxes not checked (${finalBlockers.requiredCheckboxesUnchecked.length}): ${finalBlockers.requiredCheckboxesUnchecked
-            .map((c) => `${c.name}${c.label ? " - " + c.label : ""}`)
+            .map(c => `${c.name}${c.label ? " - " + c.label : ""}`)
             .join(", ")}`
         );
       }
       if (finalBlockers?.requiredRadiosUnselected?.length > 0) {
         blockerDetails.push(
           `Required radio groups not selected (${finalBlockers.requiredRadiosUnselected.length}): ${finalBlockers.requiredRadiosUnselected
-            .map(
-              (r) =>
-                `${r.name}${r.label ? " - " + r.label : ""} (${r.optionCount} options)`
-            )
+            .map(r => `${r.name}${r.label ? " - " + r.label : ""} (${r.optionCount} options)`)
             .join(", ")}`
         );
       }
@@ -1198,21 +1345,19 @@ async function testBestFirstPartyForm(page, beacons, pageUrl, formMeta) {
         blockerDetails.push(`Validation errors: ${finalBlockers.validationErrors.join("; ")}`);
       }
 
-      const detailedReason =
-        blockerDetails.length > 0
-          ? blockerDetails.join(" | ")
-          : "Form constraints not satisfied after 3 attempts";
+      const detailedReason = blockerDetails.length > 0
+        ? blockerDetails.join(" | ")
+        : "Form constraints not satisfied after 3 attempts";
 
       return {
         status: "NOT_TESTED",
-        reason: "form_not_submittable_constraints_not_satisfied",
-        detailed_reason: detailedReason,
-        blockers: finalBlockers,
+        reason: detailedReason,
         constraint_attempts: fixAttempts,
+        blockers: finalBlockers,
       };
     }
 
-    // PHASE 4: Submit
+    // PHASE 4: Submit the form
     const beforeBeaconIdx = beacons.length;
     const beforeUrl = page.url();
 
@@ -1223,12 +1368,7 @@ async function testBestFirstPartyForm(page, beacons, pageUrl, formMeta) {
 
     try {
       await Promise.race([
-        page
-          .waitForNavigation({ timeout: 9000 })
-          .then(() => {
-            navigated = true;
-          })
-          .catch(() => null),
+        page.waitForNavigation({ timeout: 9000 }).then(() => { navigated = true; }).catch(() => null),
         submit.click({ timeout: 3000 }),
       ]);
     } catch {
@@ -1245,9 +1385,7 @@ async function testBestFirstPartyForm(page, beacons, pageUrl, formMeta) {
             });
           } catch {
             try {
-              const textField = form
-                .locator('input[type="text"], input[type="email"], input[type="tel"]')
-                .first();
+              const textField = form.locator('input[type="text"], input[type="email"], input[type="tel"]').first();
               if (await textField.count()) await textField.press("Enter");
             } catch {}
           }
@@ -1260,13 +1398,14 @@ async function testBestFirstPartyForm(page, beacons, pageUrl, formMeta) {
     const afterUrl = page.url();
     const urlChanged = afterUrl !== beforeUrl;
 
-    // IMPROVED SUCCESS DETECTION: Check for search/results page navigation
+    // Detect search/results page navigation
     const searchResultsPatterns = [
       /\/search/i,
       /\/results/i,
       /\/used-vehicles/i,
       /\/vehicles/i,
       /\/inventory/i,
+      /\/stock/i,
       /[?&]q=/i,
       /[?&]search=/i,
       /[?&]make=/i,
@@ -1274,6 +1413,14 @@ async function testBestFirstPartyForm(page, beacons, pageUrl, formMeta) {
     ];
 
     const navigatedToSearchResults = urlChanged && searchResultsPatterns.some(pattern => pattern.test(afterUrl));
+
+    if (navigatedToSearchResults) {
+      return {
+        status: "NOT_TESTED",
+        reason: "Search form detected - navigated to search/results page (not a lead form)",
+        submit_evidence: { urlChanged, navigatedToSearchResults, beforeUrl, afterUrl },
+      };
+    }
 
     // Thank you page patterns
     const thankYouPatterns = [
@@ -1288,65 +1435,36 @@ async function testBestFirstPartyForm(page, beacons, pageUrl, formMeta) {
 
     const navigatedToThankYou = urlChanged && thankYouPatterns.some(pattern => pattern.test(afterUrl));
 
-    const successSignal = await page
-      .evaluate(() => {
-        const text = (document.body?.innerText || "").toLowerCase();
-        return (
-          text.includes("thank you") ||
-          text.includes("thanks for") ||
-          text.includes("message has been sent") ||
-          text.includes("message sent") ||
-          text.includes("we'll be in touch") ||
-          text.includes("we will be in touch") ||
-          text.includes("successfully sent") ||
-          text.includes("submission successful") ||
-          text.includes("form submitted")
-        );
-      })
-      .catch(() => false);
+    const successSignal = await page.evaluate(() => {
+      const text = (document.body?.innerText || "").toLowerCase();
+      return (
+        text.includes("thank you") ||
+        text.includes("thanks for") ||
+        text.includes("message has been sent") ||
+        text.includes("message sent") ||
+        text.includes("we'll be in touch") ||
+        text.includes("we will be in touch") ||
+        text.includes("successfully sent") ||
+        text.includes("submission successful") ||
+        text.includes("form submitted")
+      );
+    }).catch(() => false);
 
-    // Classify submission based on improved logic
-    let submittedSuccessfully = false;
-    let submissionType = null;
+    let submittedSuccessfully = navigatedToThankYou || successSignal || urlChanged;
 
-    if (navigatedToSearchResults) {
-      submittedSuccessfully = false;
-      submissionType = "search_form";
-    } else if (navigatedToThankYou || successSignal) {
-      submittedSuccessfully = true;
-      submissionType = "lead_form";
-    } else if (urlChanged) {
-      submittedSuccessfully = true;
-      submissionType = "possible_lead_form";
-    }
-
+    // Check GA4 beacons
     const newGa4 = beacons.slice(beforeBeaconIdx).filter((b) => b.type === "GA4");
-
     const meaningfulEvents = newGa4.filter((b) => {
       const eventName = (b.event_name || "").toLowerCase();
       if (eventName === "page_view" && urlChanged) return true;
       return !GENERIC_EVENTS.some((generic) => eventName === generic);
     });
 
-    // If navigated to search results, classify as NOT_TESTED
-    if (navigatedToSearchResults) {
-      return {
-        status: "NOT_TESTED",
-        reason: "search_form_detected",
-        submittedSuccessfully: false,
-        submission_type: submissionType,
-        submit_evidence: { urlChanged, navigatedToSearchResults, beforeUrl, afterUrl },
-        ga4_events: uniq(newGa4.map((b) => b.event_name).filter(Boolean)),
-        note: "Form navigated to search/results page - classified as search form, not lead form",
-      };
-    }
-
     if (meaningfulEvents.length > 0) {
       return {
         status: "PASS",
         reason: null,
         submittedSuccessfully,
-        submission_type: submissionType,
         submit_evidence: { urlChanged, successSignal, navigated, navigatedToThankYou, beforeUrl, afterUrl },
         ga4_events: uniq(meaningfulEvents.map((b) => b.event_name).filter(Boolean)),
         evidence_urls: meaningfulEvents.slice(0, 5).map((b) => b.url),
@@ -1357,51 +1475,208 @@ async function testBestFirstPartyForm(page, beacons, pageUrl, formMeta) {
       const genericEventsSeen = uniq(newGa4.map((b) => b.event_name).filter(Boolean));
       return {
         status: "FAIL",
-        reason: "submitted_but_no_meaningful_ga4_event",
+        reason: "Form submitted successfully but no meaningful GA4 conversion event fired",
         submittedSuccessfully,
-        submission_type: submissionType,
         submit_evidence: { urlChanged, successSignal, navigated, navigatedToThankYou, beforeUrl, afterUrl },
         ga4_events: genericEventsSeen,
-        note: "Form submitted successfully but only saw generic events. No conversion event fired.",
       };
     }
 
-    const validationText = await page
-      .evaluate(() => {
-        const els = Array.from(
-          document.querySelectorAll(
-            "[role='alert'], .error, .wpcf7-not-valid-tip, .wpcf7-response-output, .error-message, .validation-error"
-          )
-        );
-        return els
-          .map((e) => (e.textContent || "").trim())
-          .filter(Boolean)
-          .slice(0, 3)
-          .join(" | ");
-      })
-      .catch(() => "");
-
-    const pageContent = await page
-      .evaluate(() => ({
-        title: document.title,
-        bodyText: (document.body?.innerText || "").slice(0, 500),
-        url: window.location.href,
-      }))
-      .catch(() => null);
+    // Validation blocked or submit not confirmed
+    const validationText = await page.evaluate(() => {
+      const els = Array.from(
+        document.querySelectorAll(
+          "[role='alert'], .error, .wpcf7-not-valid-tip, .wpcf7-response-output, .error-message, .validation-error"
+        )
+      );
+      return els
+        .map((e) => (e.textContent || "").trim())
+        .filter(Boolean)
+        .slice(0, 3)
+        .join(" | ");
+    }).catch(() => "");
 
     return {
       status: "NOT_TESTED",
-      reason: validationText ? `validation_blocked: ${validationText}` : "submit_not_confirmed",
+      reason: validationText ? `Validation blocked: ${validationText}` : "Form submission not confirmed (no URL change or success signal)",
       ga4_events: uniq(newGa4.map((b) => b.event_name).filter(Boolean)),
-      debug_page_state: pageContent,
     };
+
   } catch (e) {
-    return { status: "NOT_TESTED", reason: `form_test_error: ${e.message}` };
+    return { status: "NOT_TESTED", reason: `Form test error: ${e.message}` };
   }
 }
 
 // ------------------------------
-// Main runner with GUARANTEED cleanup
+// TEST THIRD-PARTY IFRAME FORM
+// ------------------------------
+async function testThirdPartyIframeForm(page, beacons, iframeSrc) {
+  try {
+    // Try to access iframe
+    const iframeSelector = `iframe[src*="${iframeSrc.split('/')[2]}"]`; // Match domain
+    const iframe = page.frameLocator(iframeSelector);
+    
+    const form = iframe.locator('form').first();
+    const formExists = await form.count().catch(() => 0);
+    
+    if (formExists === 0) {
+      return {
+        status: "NOT_TESTED",
+        reason: "Cannot access third-party iframe form content (CORS blocked or form not found)",
+        iframe_src: iframeSrc,
+      };
+    }
+
+    // Try to fill and submit (same logic as first-party, but simpler)
+    const fields = iframe.locator('input, textarea, select');
+    const fieldCount = await fields.count();
+
+    for (let i = 0; i < fieldCount; i++) {
+      const field = fields.nth(i);
+      const fieldInfo = await detectFieldType(field, page);
+      await fillFormFieldSmart(page, field, fieldInfo);
+      await safeWait(page, randomDelay(300, 800));
+    }
+
+    const submit = iframe.locator('button[type="submit"], input[type="submit"]').first();
+    if (!(await submit.count())) {
+      return {
+        status: "NOT_TESTED",
+        reason: "No submit button found in third-party iframe form",
+        iframe_src: iframeSrc,
+      };
+    }
+
+    const beforeBeaconIdx = beacons.length;
+    await submit.click({ timeout: 3000 }).catch(() => null);
+    await safeWait(page, FORM_SUBMIT_WAIT_MS);
+
+    const newGa4 = beacons.slice(beforeBeaconIdx).filter((b) => b.type === "GA4");
+    const meaningfulEvents = newGa4.filter((b) => {
+      const eventName = (b.event_name || "").toLowerCase();
+      return !GENERIC_EVENTS.some((generic) => eventName === generic);
+    });
+
+    if (meaningfulEvents.length > 0) {
+      return {
+        status: "PASS",
+        reason: null,
+        iframe_src: iframeSrc,
+        ga4_events: uniq(meaningfulEvents.map((b) => b.event_name).filter(Boolean)),
+      };
+    }
+
+    return {
+      status: "FAIL",
+      reason: "Third-party iframe form submitted but no meaningful GA4 event fired",
+      iframe_src: iframeSrc,
+      ga4_events: uniq(newGa4.map((b) => b.event_name).filter(Boolean)),
+    };
+
+  } catch (e) {
+    return {
+      status: "NOT_TESTED",
+      reason: `Third-party iframe form error: ${e.message}`,
+      iframe_src: iframeSrc,
+    };
+  }
+}
+
+// ------------------------------
+// TEST ALL FORMS ON PAGE (Priority Logic)
+// ------------------------------
+async function testAllFormsOnPage(page, beacons, pageUrl) {
+  const formDiscovery = await discoverAllFormsOnPage(page, pageUrl);
+  
+  const results = {
+    page_url: pageUrl,
+    total_forms_scanned: formDiscovery.totalFormsScanned,
+    total_lead_forms_found: formDiscovery.totalLeadForms,
+    first_party_forms: [],
+    third_party_forms: [],
+    third_party_iframes: formDiscovery.thirdPartyIframes,
+    tested_third_party: false,
+    reason_for_third_party_test: null,
+  };
+
+  // PRIORITY 1: Test first-party forms
+  if (formDiscovery.firstPartyForms.length > 0) {
+    logInfo(`Found ${formDiscovery.firstPartyForms.length} first-party lead forms on ${pageUrl}`);
+
+    for (const formMeta of formDiscovery.firstPartyForms) {
+      const result = await testFirstPartyForm(page, beacons, pageUrl, formMeta);
+      
+      results.first_party_forms.push({
+        form_index: formMeta.index,
+        form_meta: formMeta,
+        status: result.status,
+        reason: result.reason || null,
+        submittedSuccessfully: result.submittedSuccessfully || null,
+        ga4_events: result.ga4_events || [],
+        evidence_urls: result.evidence_urls || [],
+        submit_evidence: result.submit_evidence || null,
+        constraint_attempts: result.constraint_attempts || 0,
+        blockers: result.blockers || null,
+      });
+
+      // If ANY first-party form PASSES → Stop, don't test third-party
+      if (result.status === "PASS") {
+        results.reason_for_third_party_test = "First-party form passed - third-party forms not tested";
+        logInfo(`✅ First-party form passed on ${pageUrl} - skipping third-party forms`);
+        return results;
+      }
+    }
+
+    // If we reach here, all first-party forms either FAILED or NOT_TESTED
+    const allFailed = results.first_party_forms.every(f => f.status === "FAIL");
+    const allNotTested = results.first_party_forms.every(f => f.status === "NOT_TESTED");
+
+    if (allFailed) {
+      results.reason_for_third_party_test = "All first-party forms failed - testing third-party as fallback";
+    } else if (allNotTested) {
+      results.reason_for_third_party_test = "All first-party forms blocked - testing third-party as fallback";
+    } else {
+      results.reason_for_third_party_test = "First-party forms had mixed issues - testing third-party as fallback";
+    }
+  } else {
+    results.reason_for_third_party_test = "No first-party forms found - testing third-party forms";
+  }
+
+  // PRIORITY 2: Test third-party forms (only if first-party didn't pass)
+  const thirdPartyToTest = [
+    ...formDiscovery.thirdPartyForms,
+    ...formDiscovery.thirdPartyIframes.map(src => ({ isIframe: true, src })),
+  ];
+
+  if (thirdPartyToTest.length > 0) {
+    results.tested_third_party = true;
+    logInfo(`Testing ${thirdPartyToTest.length} third-party forms/iframes on ${pageUrl}`);
+
+    for (const item of thirdPartyToTest) {
+      let result;
+
+      if (item.isIframe) {
+        result = await testThirdPartyIframeForm(page, beacons, item.src);
+      } else {
+        result = await testFirstPartyForm(page, beacons, pageUrl, item);
+        result.is_third_party = true;
+      }
+
+      results.third_party_forms.push(result);
+
+      // If third-party PASSES, we can stop
+      if (result.status === "PASS") {
+        logInfo(`✅ Third-party form passed on ${pageUrl}`);
+        break;
+      }
+    }
+  }
+
+  return results;
+}
+
+// ------------------------------
+// MAIN HEALTH CHECK LOGIC
 // ------------------------------
 async function trackingHealthCheckSiteInternal(url) {
   const startTs = nowIso();
@@ -1413,13 +1688,9 @@ async function trackingHealthCheckSiteInternal(url) {
     url: targetUrl,
     timestamp: startTs,
 
-    health_bucket: null,
-    test_summary: {
-      total_items: 0,
-      passed_count: 0,
-      failed_count: 0,
-      not_tested_count: 0,
-    },
+    overall_status: null,
+    why: null,
+    needs_improvement: [],
 
     pages_visited: [],
     cookie_consent: { banner_found: false, accepted: false, details: null },
@@ -1432,18 +1703,16 @@ async function trackingHealthCheckSiteInternal(url) {
     },
 
     ctas: {
-      phones: { found: 0, tested: 0, items: [] },
-      emails: { found: 0, tested: 0, items: [] },
+      phones: { found: 0, tested: 0, passed: 0, failed: 0, items: [] },
+      emails: { found: 0, tested: 0, passed: 0, failed: 0, items: [] },
     },
 
     forms: {
-      third_party_iframes_found: [],
+      total_pages_with_forms: 0,
       pages: [],
     },
 
     evidence: { network_beacons: [] },
-    issues: [],
-    site_status: "ERROR",
   };
 
   const beacons = [];
@@ -1451,12 +1720,8 @@ async function trackingHealthCheckSiteInternal(url) {
   let context = null;
   let page = null;
 
-  // Flags
-  let formFail = false; // Case A: form submitted but no GA4 conversion
-  let ctaFail = false; // CTA clicked but no GA4 conversion
-
   try {
-    logInfo(`🔍 [${SCRIPT_VERSION}] Starting tracking health check`, { url: targetUrl });
+    logInfo(`🔍 [${SCRIPT_VERSION}] Starting intelligent tracking health check`, { url: targetUrl });
 
     browser = await chromium.launch({
       headless: HEADLESS,
@@ -1484,6 +1749,7 @@ async function trackingHealthCheckSiteInternal(url) {
       Object.defineProperty(navigator, "languages", { get: () => ["en-GB", "en", "en-US"] });
     });
 
+    // Network beacon listener
     const requestHandler = (request) => {
       const reqUrl = request.url();
       const type = classifyGaBeacon(reqUrl);
@@ -1519,6 +1785,7 @@ async function trackingHealthCheckSiteInternal(url) {
 
     page.on("request", requestHandler);
 
+    // Load homepage
     const load = await safeGoto(page, targetUrl);
     if (!load.ok) throw new Error(load.error);
     results.pages_visited.push(page.url());
@@ -1526,9 +1793,11 @@ async function trackingHealthCheckSiteInternal(url) {
     await safeWait(page, INIT_WAIT_MS);
     await simulateHumanBrowsing(page);
 
+    // Handle cookie consent
     results.cookie_consent = await handleCookieConsent(page);
     await safeWait(page, 1200);
 
+    // Detect tracking
     const tracking = await detectTrackingSetup(page, beacons);
     results.tracking.tags_found = tracking.tags_found;
     results.tracking.runtime = tracking.runtime;
@@ -1536,27 +1805,44 @@ async function trackingHealthCheckSiteInternal(url) {
     results.tracking.has_tracking = tracking.hasAnyTracking;
 
     if (!results.tracking.has_tracking) {
-      results.site_status = "BUILD_REQUIRED";
-      results.health_bucket = "BUILD_REQUIRED";
-      results.issues.push("No GTM/GA4 detected (build required)");
+      results.overall_status = "FAIL";
+      results.why = "No tracking codes detected on site";
+      results.needs_improvement.push("BUILD_REQUIRED: No GTM/GA4 implementation found");
       results.evidence.network_beacons = beacons;
       return results;
     }
 
+    // Check for multiple tracking tags
+    if (tracking.tags_found.gtm.length > 1) {
+      results.needs_improvement.push(
+        `Multiple GTM tags detected: ${tracking.tags_found.gtm.join(", ")} - should only have one`
+      );
+    }
+    if (tracking.tags_found.ga4.length > 1) {
+      results.needs_improvement.push(
+        `Multiple GA4 tags detected: ${tracking.tags_found.ga4.join(", ")} - should only have one`
+      );
+    }
+
+    // Discover contact pages
     const discovered = await discoverCandidatePages(page, targetUrl);
     const pagesToVisit = [targetUrl, ...discovered].slice(0, MAX_PAGES_TO_VISIT);
 
+    logInfo(`Will visit ${pagesToVisit.length} pages for CTA testing`, { pages: pagesToVisit });
+
+    // Track unique CTAs across all pages
     const allPhonesNorm = new Set();
     const allEmailsNorm = new Set();
     const testedPhonesNorm = new Set();
     const testedEmailsNorm = new Set();
 
+    // Visit each page and test CTAs + Forms
     for (let i = 0; i < pagesToVisit.length; i++) {
       const pUrl = pagesToVisit[i];
 
       const r = await safeGoto(page, pUrl);
       if (!r.ok) {
-        results.issues.push(`Could not load page: ${pUrl}`);
+        logInfo(`⚠️ Could not load page: ${pUrl}`);
         continue;
       }
 
@@ -1565,9 +1851,10 @@ async function trackingHealthCheckSiteInternal(url) {
 
       await safeWait(page, 1200);
 
+      // Scan for CTAs
       const ctas = await scanCTAsOnPage(page);
 
-      // Phones
+      // Test Phone CTAs
       for (const rawTel of ctas.phones || []) {
         const norm = normaliseTelHref(rawTel);
         if (!norm) continue;
@@ -1581,7 +1868,7 @@ async function trackingHealthCheckSiteInternal(url) {
           const item = await testLinkCTA(page, beacons, rawTel, "phone");
           results.ctas.phones.tested++;
 
-          results.ctas.phones.items.push({
+          const itemResult = {
             href: rawTel,
             href_normalised: norm,
             page_url: actualUrl,
@@ -1591,13 +1878,16 @@ async function trackingHealthCheckSiteInternal(url) {
             beacons_delta: item.beacons_delta || 0,
             evidence_urls: item.evidence_urls || [],
             generic_events_seen: item.generic_events_seen || [],
-          });
+          };
 
-          if (item.status === "FAIL") ctaFail = true;
+          results.ctas.phones.items.push(itemResult);
+
+          if (item.status === "PASS") results.ctas.phones.passed++;
+          if (item.status === "FAIL") results.ctas.phones.failed++;
         }
       }
 
-      // Emails
+      // Test Email CTAs
       for (const rawMail of ctas.emails || []) {
         const norm = normaliseMailtoHref(rawMail);
         if (!norm) continue;
@@ -1611,7 +1901,7 @@ async function trackingHealthCheckSiteInternal(url) {
           const item = await testLinkCTA(page, beacons, rawMail, "email");
           results.ctas.emails.tested++;
 
-          results.ctas.emails.items.push({
+          const itemResult = {
             href: rawMail,
             href_normalised: norm,
             page_url: actualUrl,
@@ -1621,59 +1911,39 @@ async function trackingHealthCheckSiteInternal(url) {
             beacons_delta: item.beacons_delta || 0,
             evidence_urls: item.evidence_urls || [],
             generic_events_seen: item.generic_events_seen || [],
-          });
+          };
 
-          if (item.status === "FAIL") ctaFail = true;
+          results.ctas.emails.items.push(itemResult);
+
+          if (item.status === "PASS") results.ctas.emails.passed++;
+          if (item.status === "FAIL") results.ctas.emails.failed++;
         }
       }
 
-      const formMeta = await pickBestFirstPartyFormOnPage(page, actualUrl);
-
-      if (formMeta.third_party_iframes?.length) {
-        results.forms.third_party_iframes_found.push(
-          ...formMeta.third_party_iframes.map((src) => ({ page_url: actualUrl, iframe_src: src }))
-        );
+      // Test Forms (with priority logic)
+      const formResults = await testAllFormsOnPage(page, beacons, actualUrl);
+      
+      if (formResults.total_lead_forms_found > 0) {
+        results.forms.total_pages_with_forms++;
       }
 
-      const formTest = await testBestFirstPartyForm(page, beacons, actualUrl, formMeta);
+      results.forms.pages.push(formResults);
 
-      results.forms.pages.push({
-        page_url: actualUrl,
-        best_form_meta: formMeta.best_form
-          ? {
-              index: formMeta.best_form.index,
-              score: formMeta.best_form.score,
-              inputCount: formMeta.best_form.inputCount,
-              hasEmail: formMeta.best_form.hasEmail,
-              hasTextarea: formMeta.best_form.hasTextarea,
-              submitText: formMeta.best_form.submitText,
-              third_party_by_action: formMeta.best_form.third_party_by_action,
-            }
-          : null,
-        status: formTest.status,
-        reason: formTest.reason || null,
-        detailed_reason: formTest.detailed_reason || null,
-        blockers: formTest.blockers || null,
-        constraint_attempts: formTest.constraint_attempts || 0,
-        submittedSuccessfully: formTest.submittedSuccessfully ?? null,
-        submission_type: formTest.submission_type ?? null,
-        submit_evidence: formTest.submit_evidence ?? null,
-        ga4_events: formTest.ga4_events ?? [],
-        evidence_urls: formTest.evidence_urls ?? [],
-        note: formTest.note ?? null,
-        debug_page_state: formTest.debug_page_state ?? null,
-      });
+      // Check if we got a definitive form result (PASS or FAIL)
+      const hasPassingForm = [
+        ...formResults.first_party_forms,
+        ...formResults.third_party_forms,
+      ].some(f => f.status === "PASS");
 
-      if (
-        formTest.status === "FAIL" &&
-        formTest.reason === "submitted_but_no_meaningful_ga4_event"
-      ) {
-        formFail = true;
-      }
+      const hasFailingForm = [
+        ...formResults.first_party_forms,
+        ...formResults.third_party_forms,
+      ].some(f => f.status === "FAIL");
 
-      if (formTest.status === "PASS" || formTest.status === "FAIL") {
+      if (hasPassingForm || hasFailingForm) {
         logInfo(
-          `✅ Got definitive form result (${formTest.status}) on page ${i + 1}/${pagesToVisit.length}, stopping crawl`
+          `Got definitive form result on page ${i + 1}/${pagesToVisit.length} - stopping crawl`,
+          { hasPassingForm, hasFailingForm }
         );
         break;
       }
@@ -1681,82 +1951,186 @@ async function trackingHealthCheckSiteInternal(url) {
       await safeWait(page, 400);
     }
 
+    // Update CTA counts
     results.ctas.phones.found = allPhonesNorm.size;
     results.ctas.emails.found = allEmailsNorm.size;
 
-    const allItems = [
-      ...results.ctas.phones.items,
-      ...results.ctas.emails.items,
-      ...results.forms.pages,
-    ];
+    // ========================================
+    // CLASSIFICATION LOGIC
+    // ========================================
+    
+    // Collect all form results
+    const allFormResults = results.forms.pages.flatMap(p => [
+      ...p.first_party_forms,
+      ...p.third_party_forms,
+    ]);
 
-    const passCount = allItems.filter((x) => x.status === "PASS").length;
-    const failCount = allItems.filter((x) => x.status === "FAIL").length;
-    const notTestedCount = allItems.filter((x) => x.status === "NOT_TESTED").length;
+    // Calculate form stats
+    const formsPassed = allFormResults.filter(f => f.status === "PASS").length;
+    const formsFailed = allFormResults.filter(f => f.status === "FAIL").length;
+    const formsNotTested = allFormResults.filter(f => f.status === "NOT_TESTED").length;
+    const formsTested = formsPassed + formsFailed;
+    const formsFound = allFormResults.length;
 
-    const totalTestable = passCount + failCount;
-    const totalItems = allItems.length;
-
-    results.test_summary = {
-      total_items: totalItems,
-      passed_count: passCount,
-      failed_count: failCount,
-      not_tested_count: notTestedCount,
+    // Determine status for each CTA category
+    const categoryStatus = {
+      phones: null,
+      emails: null,
+      forms: null,
     };
 
-    // BUILD_REQUIRED
-    if (!results.tracking.has_tracking) {
-      results.site_status = "BUILD_REQUIRED";
-      results.health_bucket = "BUILD_REQUIRED";
-    }
-    // NOT_TESTED
-    else if (totalItems > 0 && totalTestable === 0) {
-      results.site_status = "NOT_TESTED";
-      results.health_bucket = "NOT_TESTED";
-      results.issues.push("Nothing could be tested (CAPTCHA / constraints / third-party forms)");
-    }
-    // FAIL
-    else if (totalTestable > 0 && passCount === 0 && failCount > 0) {
-      results.site_status = "FAIL";
-      results.health_bucket = "FAIL";
-    }
-    // OK
-    else if (totalTestable > 0 && passCount === totalTestable) {
-      results.site_status = "OK";
-      results.health_bucket = "OK";
-    }
-    // WARN
-    else if (totalTestable > 0 && passCount > 0 && failCount > 0) {
-      results.site_status = "WARN";
-      results.health_bucket = "WARN";
-    }
-    // fallback
-    else {
-      results.site_status = "NOT_TESTED";
-      results.health_bucket = "NOT_TESTED";
+    // Phones
+    if (results.ctas.phones.found === 0) {
+      categoryStatus.phones = "NOT_PRESENT"; // No phones on site
+    } else if (results.ctas.phones.tested === 0) {
+      categoryStatus.phones = "NOT_TESTED"; // Phones exist but couldn't be tested
+    } else if (results.ctas.phones.passed === 0 && results.ctas.phones.failed > 0) {
+      categoryStatus.phones = "ALL_FAILED"; // All tested phones failed
+    } else if (results.ctas.phones.passed > 0) {
+      categoryStatus.phones = "AT_LEAST_ONE_PASSED"; // At least one passed
     }
 
-    if (formFail) results.issues.push("At least one form submitted but no meaningful GA4 event fired");
-    if (ctaFail) results.issues.push("At least one CTA click produced no meaningful GA4 beacon");
+    // Emails
+    if (results.ctas.emails.found === 0) {
+      categoryStatus.emails = "NOT_PRESENT";
+    } else if (results.ctas.emails.tested === 0) {
+      categoryStatus.emails = "NOT_TESTED";
+    } else if (results.ctas.emails.passed === 0 && results.ctas.emails.failed > 0) {
+      categoryStatus.emails = "ALL_FAILED";
+    } else if (results.ctas.emails.passed > 0) {
+      categoryStatus.emails = "AT_LEAST_ONE_PASSED";
+    }
+
+    // Forms
+    if (formsFound === 0) {
+      categoryStatus.forms = "NOT_PRESENT";
+    } else if (formsTested === 0) {
+      categoryStatus.forms = "NOT_TESTED";
+    } else if (formsPassed === 0 && formsFailed > 0) {
+      categoryStatus.forms = "ALL_FAILED";
+    } else if (formsPassed > 0) {
+      categoryStatus.forms = "AT_LEAST_ONE_PASSED";
+    }
+
+    logInfo("Category status:", categoryStatus);
+
+    // Determine overall status
+    const categoriesPresent = Object.entries(categoryStatus)
+      .filter(([_, status]) => status !== "NOT_PRESENT")
+      .map(([cat, _]) => cat);
+
+    const categoriesAllFailed = categoriesPresent.filter(
+      cat => categoryStatus[cat] === "ALL_FAILED"
+    );
+
+    const categoriesNotTested = categoriesPresent.filter(
+      cat => categoryStatus[cat] === "NOT_TESTED"
+    );
+
+    const categoriesWithAtLeastOnePass = categoriesPresent.filter(
+      cat => categoryStatus[cat] === "AT_LEAST_ONE_PASSED"
+    );
+
+    // RULE: If ANY category present completely failed → FAIL
+    if (categoriesAllFailed.length > 0) {
+      results.overall_status = "FAIL";
+      results.why = `${categoriesAllFailed.map(cat => cat.charAt(0).toUpperCase() + cat.slice(1)).join(", ")} category completely failed - no CTAs tracking properly`;
+      
+      // Add specific failure details
+      categoriesAllFailed.forEach(cat => {
+        if (cat === "phones") {
+          results.needs_improvement.push(
+            `All ${results.ctas.phones.tested} phone CTAs failed to fire GA4 conversion events`
+          );
+        } else if (cat === "emails") {
+          results.needs_improvement.push(
+            `All ${results.ctas.emails.tested} email CTAs failed to fire GA4 conversion events`
+          );
+        } else if (cat === "forms") {
+          results.needs_improvement.push(
+            `All ${formsTested} forms failed to fire GA4 conversion events after successful submission`
+          );
+        }
+      });
+    }
+    // RULE: If ALL categories present are NOT_TESTED → NOT_TESTED
+    else if (categoriesPresent.length > 0 && categoriesNotTested.length === categoriesPresent.length) {
+      results.overall_status = "NOT_TESTED";
+      results.why = "All CTAs could not be tested due to technical blockers";
+      
+      categoriesNotTested.forEach(cat => {
+        if (cat === "phones") {
+          const reasons = uniq(results.ctas.phones.items.map(i => i.reason).filter(Boolean));
+          results.needs_improvement.push(`Phone CTAs not testable: ${reasons.join("; ")}`);
+        } else if (cat === "emails") {
+          const reasons = uniq(results.ctas.emails.items.map(i => i.reason).filter(Boolean));
+          results.needs_improvement.push(`Email CTAs not testable: ${reasons.join("; ")}`);
+        } else if (cat === "forms") {
+          const reasons = uniq(allFormResults.filter(f => f.status === "NOT_TESTED").map(f => f.reason).filter(Boolean));
+          results.needs_improvement.push(`Forms not testable: ${reasons.slice(0, 3).join("; ")}`);
+        }
+      });
+    }
+    // RULE: If ALL categories present have at least one pass → PASS
+    else if (categoriesPresent.length > 0 && categoriesWithAtLeastOnePass.length === categoriesPresent.length) {
+      results.overall_status = "PASS";
+      results.why = "All CTA categories have at least one working conversion event";
+      
+      // Add needs improvement for partial failures
+      if (results.ctas.phones.failed > 0) {
+        const failedItems = results.ctas.phones.items.filter(i => i.status === "FAIL");
+        results.needs_improvement.push(
+          `${results.ctas.phones.failed} out of ${results.ctas.phones.tested} phone CTAs not tracking: ${failedItems.map(i => i.href).join(", ")}`
+        );
+      }
+      if (results.ctas.emails.failed > 0) {
+        const failedItems = results.ctas.emails.items.filter(i => i.status === "FAIL");
+        results.needs_improvement.push(
+          `${results.ctas.emails.failed} out of ${results.ctas.emails.tested} email CTAs not tracking: ${failedItems.map(i => i.href).join(", ")}`
+        );
+      }
+      if (formsFailed > 0) {
+        const failedForms = allFormResults.filter(f => f.status === "FAIL");
+        results.needs_improvement.push(
+          `${formsFailed} out of ${formsTested} forms not tracking properly (submitted but no conversion event)`
+        );
+      }
+    }
+    // Mixed scenario
+    else {
+      if (categoriesWithAtLeastOnePass.length > 0) {
+        results.overall_status = "PASS";
+        results.why = "Some CTA categories working, others could not be tested";
+        
+        categoriesNotTested.forEach(cat => {
+          results.needs_improvement.push(`${cat.charAt(0).toUpperCase() + cat.slice(1)} CTAs could not be tested`);
+        });
+      } else {
+        results.overall_status = "NOT_TESTED";
+        results.why = "No CTAs could be successfully tested";
+      }
+    }
 
     results.evidence.network_beacons = beacons;
 
     logInfo("✅ Health check complete", {
       url: targetUrl,
-      site_status: results.site_status,
+      overall_status: results.overall_status,
+      why: results.why,
+      needs_improvement: results.needs_improvement,
       pages_visited: results.pages_visited.length,
-      forms_tested: results.forms.pages.length,
-      phone_tested: results.ctas.phones.tested,
-      email_tested: results.ctas.emails.tested,
+      phones: `${results.ctas.phones.passed}/${results.ctas.phones.tested} passed`,
+      emails: `${results.ctas.emails.passed}/${results.ctas.emails.tested} passed`,
+      forms: `${formsPassed}/${formsTested} passed`,
     });
 
     return results;
+
   } catch (error) {
     logInfo("❌ Fatal error in health check", { url: targetUrl, error: error.message });
     results.ok = false;
-    results.site_status = "ERROR";
-    results.health_bucket = "ERROR";
-    results.issues.push(`Error: ${error.message}`);
+    results.overall_status = "ERROR";
+    results.why = `Fatal error: ${error.message}`;
     results.evidence.network_beacons = beacons;
     return results;
   } finally {
@@ -1830,8 +2204,9 @@ async function trackingHealthCheckSite(url) {
       url: normaliseUrl(url),
       timestamp: nowIso(),
 
-      health_bucket: "ERROR",
-      test_summary: { total_items: 0, passed_count: 0, failed_count: 0, not_tested_count: 0 },
+      overall_status: "ERROR",
+      why: `Global timeout or error: ${error.message}`,
+      needs_improvement: [],
 
       pages_visited: [],
       cookie_consent: { banner_found: false, accepted: false, details: null },
@@ -1842,13 +2217,11 @@ async function trackingHealthCheckSite(url) {
         has_tracking: false,
       },
       ctas: {
-        phones: { found: 0, tested: 0, items: [] },
-        emails: { found: 0, tested: 0, items: [] },
+        phones: { found: 0, tested: 0, passed: 0, failed: 0, items: [] },
+        emails: { found: 0, tested: 0, passed: 0, failed: 0, items: [] },
       },
-      forms: { third_party_iframes_found: [], pages: [] },
+      forms: { total_pages_with_forms: 0, pages: [] },
       evidence: { network_beacons: [] },
-      issues: [`Global timeout or error: ${error.message}`],
-      site_status: "ERROR",
     };
   } finally {
     releaseCheckSlot();
