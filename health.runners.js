@@ -30,7 +30,7 @@ const MAX_PHONE_TESTS = Number(process.env.HEALTH_MAX_PHONE || 10);
 const MAX_EMAIL_TESTS = Number(process.env.HEALTH_MAX_EMAIL || 10);
 const NAV_TIMEOUT_MS = Number(process.env.HEALTH_NAV_TIMEOUT_MS || 45000);
 const INIT_WAIT_MS = Number(process.env.HEALTH_INIT_WAIT_MS || 3500);
-const HEADLESS = (process.env.HEALTH_HEADLESS || "true").toLowerCase() !== "false";
+const HEADLESS = false;
 const POST_ACTION_POLL_MS = Number(process.env.HEALTH_POST_ACTION_POLL_MS || 8000);
 const FORM_SUBMIT_WAIT_MS = Number(process.env.HEALTH_FORM_WAIT_MS || 15000);
 const GLOBAL_TIMEOUT_MS = Number(process.env.HEALTH_GLOBAL_TIMEOUT_MS || 300000);
