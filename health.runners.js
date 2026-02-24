@@ -6,6 +6,7 @@ const SCRIPT_VERSION = "2026-02-19T00:00:00Z-V6-OPTIMISED";
 const { chromium } = require("playwright");
 const fs = require("fs").promises;
 const path = require("path");
+const fetch = (...args) => import("node-fetch").then(({ default: fetch }) => fetch(...args));
 
 /**
  * Logging
@@ -205,6 +206,59 @@ async function safeGoto(page, url) {
     }
   }
 }
+
+
+
+async function fetchTrackingFromHtmlFallback(url) {
+  try {
+    const res = await fetch(url, {
+      method: "GET",
+      headers: {
+        "User-Agent":
+          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
+      },
+      redirect: "follow",
+    });
+
+    const html = await res.text();
+
+    const gtmId =
+      (html.match(/googletagmanager\.com\/gtm\.js\?id=(GTM-[A-Z0-9]+)/i) || [])[1] || null;
+
+    const ga4Id =
+      (html.match(/gtag\('config',\s*'(G-[A-Z0-9]+)'\)/i) ||
+        html.match(/gtag\/js\?id=(G-[A-Z0-9]+)/i) ||
+        [])[1] || null;
+
+    return {
+      gtm_ids: gtmId ? [gtmId] : [],
+      ga4_ids: ga4Id ? [ga4Id] : [],
+      has_tracking: !!(gtmId || ga4Id),
+      source: "html_fallback",
+    };
+  } catch (e) {
+    return {
+      gtm_ids: [],
+      ga4_ids: [],
+      has_tracking: false,
+      source: "html_fallback_error",
+      error: e.message,
+    };
+  }
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 // ------------------------------
 // Concurrency Management
@@ -1679,7 +1733,7 @@ async function trackingHealthCheckSiteInternal(url) {
     await safeWait(page, 800); // reduced from 1200
 
     // Wait for GTM/GA4 to load (up to 8 seconds — reduced from 10)
-    const trackingLoadTimeout = 8000;
+    const trackingLoadTimeout = 15000;
     const trackingCheckStart = Date.now();
     let trackingLoaded = false;
 
@@ -1700,19 +1754,38 @@ async function trackingHealthCheckSiteInternal(url) {
       }
     }
 
-    const tracking = await detectTrackingSetup(page, beacons);
-    results.tracking.tags_found = tracking.tags_found;
-    results.tracking.runtime = tracking.runtime;
-    results.tracking.beacon_counts = tracking.beacon_counts;
-    results.tracking.has_tracking = tracking.hasAnyTracking;
+let tracking = await detectTrackingSetup(page, beacons);
 
-    if (!results.tracking.has_tracking) {
-      results.overall_status = "FAIL";
-      results.why = "No tracking codes detected on site";
-      results.needs_improvement.push("BUILD_REQUIRED: No GTM/GA4 implementation found");
-      results.evidence.network_beacons = beacons;
-      return results;
-    }
+results.tracking.tags_found = tracking.tags_found;
+results.tracking.runtime = tracking.runtime;
+results.tracking.beacon_counts = tracking.beacon_counts;
+results.tracking.has_tracking = tracking.hasAnyTracking;
+
+// 🔁 FALLBACK: static HTML scan if Playwright missed it
+if (!results.tracking.has_tracking) {
+  logInfo("Playwright missed tracking – running HTML fallback scan");
+
+  const fallback = await fetchTrackingFromHtmlFallback(targetUrl);
+
+  if (fallback.has_tracking) {
+    results.tracking.has_tracking = true;
+    results.tracking.tags_found.gtm.push(...fallback.gtm_ids);
+    results.tracking.tags_found.ga4.push(...fallback.ga4_ids);
+    results.tracking.fallback_used = true;
+    results.tracking.fallback_source = fallback.source;
+
+    logInfo("HTML fallback detected tracking", fallback);
+  }
+}
+
+if (!results.tracking.has_tracking) {
+  results.overall_status = "FAIL";
+  results.why = "No tracking codes detected on site (Playwright + HTML fallback)";
+  results.needs_improvement.push("BUILD_REQUIRED: No GTM/GA4 implementation found");
+  results.evidence.network_beacons = beacons;
+  return results;
+}
+
 
     if (tracking.tags_found.gtm.length > 1) {
       results.needs_improvement.push(`Multiple GTM tags detected: ${tracking.tags_found.gtm.join(", ")} - should only have one`);
