@@ -41,10 +41,10 @@ const MAX_CONCURRENT_CHECKS = Number(process.env.HEALTH_MAX_CONCURRENT || 2);
 // email: example.com is RFC-reserved, never a real inbox
 // phone: 01632960123 is Ofcom-reserved for testing, never a real number
 const TEST_VALUES = {
-  firstName: "Test",
-  lastName: "User",
-  fullName: "Test User",
-  email: process.env.HEALTH_TEST_EMAIL || "test.user@example.com",
+  firstName: "Add",
+  lastName: "People",
+  fullName: "Add People",
+  email: process.env.HEALTH_TEST_EMAIL || "test@addpeople.com",
   phone: process.env.HEALTH_TEST_PHONE || "01632960123",
   message: process.env.HEALTH_TEST_MESSAGE || "This is a tracking health check. Please ignore.",
   company: "Test Company",
