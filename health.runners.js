@@ -1,7 +1,7 @@
 // /health-check-v9.js
 // INTELLIGENT TRACKING HEALTH CHECK
-// Features: Multi-Stage Forms, Hash-URL Sanitisation, Social Link Blocking, Strict Conversions, Priority Chain, Score Counts, Radio/Checkbox Fix, Specific Form Reasons
-const SCRIPT_VERSION = "2026-03-04T00:00:00Z-V9-SPECIFIC-FORM-REASONS";
+// Features: Multi-Stage Forms, Hash-URL Sanitisation, Social Link Blocking, Strict Conversions, Priority Chain, Score Counts, Radio/Checkbox Fix, Specific Form Reasons, GTM-GA4 Linking
+const SCRIPT_VERSION = "2026-03-04T00:00:00Z-V9-GTM-LINKING-STRICT";
 
 const { chromium } = require("playwright");
 const fetch = (...args) => import("node-fetch").then(({ default: fetch }) => fetch(...args));
@@ -104,7 +104,7 @@ async function safeEvaluate(page, func, ...args) {
 function classifyGaBeacon(reqUrl) {
   const u = (reqUrl || "").toLowerCase();
   if (u.includes("/g/collect") || u.includes("/r/collect")) return "GA4";
-  if (u.includes("gtag/js")) return "GTAG"; // Prioritized 
+  if (u.includes("gtag/js")) return "GTAG"; 
   if (u.includes("google-analytics.com")) return "GA";
   if (u.includes("googletagmanager.com") || u.includes("gtm.js")) return "GTM";
   return "OTHER";
@@ -132,18 +132,6 @@ async function safeGoto(page, url) {
     } catch (e2) {
       return { ok: false, error: e2.message };
     }
-  }
-}
-
-async function fetchTrackingFromHtmlFallback(url) {
-  try {
-    const res = await fetch(url, { headers: { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)" }, redirect: "follow" });
-    const html = await res.text();
-    const gtmId = (html.match(/googletagmanager\.com\/gtm\.js\?id=(GTM-[A-Z0-9]+)/i) || [])[1] || null;
-    const ga4Id = (html.match(/gtag\('config',\s*'(G-[A-Z0-9]+)'\)/i) || html.match(/gtag\/js\?id=(G-[A-Z0-9]+)/i) || [])[1] || null;
-    return { gtm_ids: gtmId ? [gtmId] : [], ga4_ids: ga4Id ? [ga4Id] : [], has_tracking: !!(gtmId || ga4Id), source: "html_fallback" };
-  } catch (e) {
-    return { gtm_ids: [], ga4_ids: [], has_tracking: false, source: "html_fallback_error", error: e.message };
   }
 }
 
@@ -214,61 +202,67 @@ async function handleCookieConsent(page) {
 }
 
 // ------------------------------
-// Tracking Detection (Deep Scan)
+// Tracking Detection (GTM Linking Check)
 // ------------------------------
 async function detectTrackingSetup(page, beacons) {
+  // 1. DOM Scan (Code on page)
   let tagData = await safeEvaluate(page, () => {
-    const tags = { gtm: [], ga4: [], aw: [] };
-    
+    const tags = { gtm: [], ga4: [] };
     const extract = (str) => {
       if (typeof str !== 'string') return;
       const upper = str.toUpperCase();
       tags.gtm.push(...(upper.match(/GTM-[A-Z0-9]+/g) || []));
       tags.ga4.push(...(upper.match(/G-[A-Z0-9]+/g) || []));
-      tags.aw.push(...(upper.match(/AW-[A-Z0-9]+/g) || []));
     };
-
-    for (const s of document.querySelectorAll("script")) {
-      extract(s.innerHTML);
-      extract(s.src);
-    }
-
-    if (Array.isArray(window.dataLayer)) {
-      window.dataLayer.forEach(push => {
-        try { extract(JSON.stringify(push)); } catch(e){}
-      });
-    }
-
-    if (window.google_tag_manager) {
-      Object.keys(window.google_tag_manager).forEach(key => extract(key));
-    }
-
-    return {
-      gtm: Array.from(new Set(tags.gtm)),
-      ga4: Array.from(new Set(tags.ga4)),
-      aw: Array.from(new Set(tags.aw)),
-      gtmLoaded: !!window.google_tag_manager,
-      gaRuntimePresent: !!window.gtag || !!window.dataLayer,
-    };
+    for (const s of document.querySelectorAll("script")) { extract(s.innerHTML); extract(s.src); }
+    if (Array.isArray(window.dataLayer)) { window.dataLayer.forEach(push => { try { extract(JSON.stringify(push)); } catch(e){} }); }
+    if (window.google_tag_manager) { Object.keys(window.google_tag_manager).forEach(key => extract(key)); }
+    return { gtm: Array.from(new Set(tags.gtm)), ga4: Array.from(new Set(tags.ga4)) };
   });
 
-  if (!tagData) tagData = { gtm: [], ga4: [], aw: [], gtmLoaded: false, gaRuntimePresent: false };
+  if (!tagData) tagData = { gtm: [], ga4: [] };
+
+  // 2. Network Analysis & Link Verification
+  const gtmContainers = new Set(tagData.gtm);
+  const linkedGa4Tags = new Set();
+  const unlinkedGa4Tags = new Set();
 
   beacons.forEach(b => {
+    // Collect GTMs from network
     const urlUpper = b.url.toUpperCase();
-    tagData.gtm.push(...(urlUpper.match(/GTM-[A-Z0-9]+/g) || []));
-    tagData.ga4.push(...(urlUpper.match(/G-[A-Z0-9]+/g) || []));
-    tagData.aw.push(...(urlUpper.match(/AW-[A-Z0-9]+/g) || []));
+    const gtmMatches = urlUpper.match(/GTM-[A-Z0-9]+/g);
+    if (gtmMatches) gtmMatches.forEach(id => gtmContainers.add(id));
+
+    // Analyze GA4 Beacons for "gtm=" param
+    if (b.type === "GA4") {
+      try {
+        const urlObj = new URL(b.url);
+        const tid = urlObj.searchParams.get("tid"); // G-XXXXXX
+        const gtmHash = urlObj.searchParams.get("gtm"); // Hash ID confirming linkage
+
+        if (tid) {
+          if (gtmHash) {
+            linkedGa4Tags.add(tid);
+          } else {
+            unlinkedGa4Tags.add(tid);
+          }
+        }
+      } catch {}
+    }
   });
 
-  tagData.gtm = Array.from(new Set(tagData.gtm));
-  tagData.ga4 = Array.from(new Set(tagData.ga4));
-  tagData.aw = Array.from(new Set(tagData.aw));
+  const finalGtm = Array.from(gtmContainers);
+  const finalLinkedGa4 = Array.from(linkedGa4Tags);
 
-  const beaconCounts = { gtm: beacons.filter((b) => b.type === "GTM").length, ga4: beacons.filter((b) => b.type === "GA4").length };
-  const hasAnyTracking = tagData.gtm.length > 0 || tagData.ga4.length > 0 || tagData.gtmLoaded || beaconCounts.gtm > 0 || beaconCounts.ga4 > 0;
-  
-  return { tags_found: tagData, runtime: tagData, beacon_counts: beaconCounts, hasAnyTracking };
+  return { 
+    tags_found: {
+      gtm: finalGtm,
+      ga4: finalLinkedGa4, // We ONLY return linked ones as valid
+      unlinked_ga4: Array.from(unlinkedGa4Tags) // Store these for debug/info
+    },
+    has_gtm: finalGtm.length > 0,
+    has_linked_ga4: finalLinkedGa4.length > 0
+  };
 }
 
 // ------------------------------
@@ -685,7 +679,6 @@ async function testFirstPartyForm(page, beacons, pageUrl, formMeta) {
         return captchas.length > 0;
       });
 
-      // If captcha detected, fail immediately per user request for specific reason
       if (captchaDetected) {
         return { status: "FAIL", reason: "Form could not be submitted due to bot protection" };
       }
@@ -821,19 +814,25 @@ async function trackingHealthCheckSiteInternal(url) {
       await safeWait(page, 2500); 
     }
 
+    // --- DETECT TRACKING (WITH GTM LINKING LOGIC) ---
     let tracking = await detectTrackingSetup(page, beacons);
     results.tracking = tracking;
     
-    if (!tracking.hasAnyTracking) {
-      const fallback = await fetchTrackingFromHtmlFallback(targetUrl);
-      if (fallback.has_tracking) results.tracking.has_tracking = true;
-      else {
-        results.overall_status = "FAIL";
-        results.why = "No tracking codes detected on site";
-        results.needs_improvement.push("BUILD_REQUIRED: No GTM/GA4 implementation found");
-        logInfo(`❌ Health check failed early - No tracking detected`, { url: targetUrl });
-        return results;
-      }
+    // --- EARLY FAIL LOGIC (STRICT) ---
+    if (!tracking.has_gtm) {
+      results.overall_status = "FAIL";
+      results.why = "BUILD_REQUIRED: No GTM container found";
+      results.needs_improvement.push("Install Google Tag Manager container.");
+      logInfo(`❌ Health check failed early - No GTM detected`, { url: targetUrl });
+      return results;
+    }
+
+    if (!tracking.has_linked_ga4) {
+      results.overall_status = "FAIL";
+      results.why = "BUILD_REQUIRED: GTM found, but no GA4 tags are firing through it (Missing 'gtm' parameter in collect calls)";
+      results.needs_improvement.push("Ensure GA4 tags are configured INSIDE Google Tag Manager, not hardcoded.");
+      logInfo(`❌ Health check failed early - No Linked GA4 detected`, { url: targetUrl });
+      return results;
     }
 
     const discovered = await discoverCandidatePages(page, targetUrl);
@@ -988,7 +987,7 @@ async function trackingHealthCheckSiteInternal(url) {
       results.why = "Logic Fallback: State could not be determined";
     }
 
-    // Populate needs_improvement with specific form failure reasons if forms failed/not_tested
+    // Populate specific failure reasons
     allFormResults.forEach(f => {
       if (f.status !== "PASS") {
          results.needs_improvement.push(`Form Error: ${f.reason}`);
