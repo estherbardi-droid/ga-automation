@@ -57,7 +57,7 @@ async function clickWebPlatform(page) {
     const btn = page.locator(selector).filter({ hasText: /^Web$/i });
     if (await btn.count() > 0) {
       webBtn = btn.first();
-      console.log(`✅ Found Web button with selector: ${selector}`);
+      console.log(`Found Web button with selector: ${selector}`);
       break;
     }
   }
@@ -75,7 +75,7 @@ async function clickWebPlatform(page) {
     // Double-check if we're already on the form
     await page.waitForTimeout(1000);
     if (await websiteInput.count() > 0) {
-      console.log('✅ Confirmed: already on web stream form');
+      console.log(' Confirmed: already on web stream form');
       return;
     }
     
@@ -86,7 +86,7 @@ async function clickWebPlatform(page) {
   await webBtn.click({ timeout: 15000 });
   await page.waitForTimeout(1000);
   
-  console.log('✅ Clicked Web platform button');
+  console.log(' Clicked Web platform button');
 }
 
 
