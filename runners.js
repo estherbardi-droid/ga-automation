@@ -35,7 +35,7 @@ async function clickWebPlatform(page) {
   // If we're already on the web stream form, skip the platform picker
   const websiteInput = page.getByPlaceholder('www.mywebsite.com');
   if (await websiteInput.count() > 0) {
-    console.log('✅ Already on web stream form, skipping platform selection');
+    console.log(' Already on web stream form, skipping platform selection');
     return;
   }
   
