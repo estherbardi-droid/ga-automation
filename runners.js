@@ -236,67 +236,31 @@ async function ensureCorrectPropertyContext(page, accountName, propertyName) {
 
 
 async function openAccountViaAccountsSearch(page, accountName) {
-  // Navigate to GA home to ensure we're in a stable state
-  await page.goto('https://analytics.google.com/analytics/web', { waitUntil: 'domcontentloaded' });
-  await page.waitForTimeout(2000);
+  await page.waitForTimeout(800);
+  console.log("📍 Current URL:", page.url());
 
-  // Click the account/property selector button in the top left (the one that shows current account/property name)
-  const accountSelectorBtn = page.locator(
-    'button[aria-label*="account"], button[aria-label*="property"], ' +
-    'button:has-text("All accounts"), ' +
-    '[class*="account-selector"], [class*="property-selector"]'
-  ).first();
-
-  // Fallback: look for any button near the top that contains the current property/account name
-  const topButton = page.locator('header button, [role="banner"] button').filter({ 
-    hasText: /GA4|account|property/i 
-  }).first();
-
-  if (await accountSelectorBtn.count() > 0) {
-    await accountSelectorBtn.click({ timeout: 15000 });
-  } else if (await topButton.count() > 0) {
-    await topButton.click({ timeout: 15000 });
-  } else {
-    // Last resort: click near the top-left where the account name typically appears
-    await page.mouse.click(200, 30);
-  }
-
+  // Click the breadcrumb span directly — bubbles up to parent button
+  const breadcrumb = page.locator('[debug-id="selected-entity-text"]').first();
+  await breadcrumb.waitFor({ timeout: 10000 });
+  await breadcrumb.click();
   await page.waitForTimeout(1500);
 
-  // Now find the search input INSIDE the account switcher dropdown (not the main page search)
-  const dropdownSearchInput = page.locator(
-    '.cdk-overlay-pane:visible input[type="text"], ' +
-    '[role="dialog"]:visible input[type="text"], ' +
-    '.mat-mdc-dialog-container:visible input[type="text"], ' +
-    '[aria-label*="Search"]:visible'
-  ).first();
-
-  await dropdownSearchInput.waitFor({ timeout: 15000 });
-  await dropdownSearchInput.fill('');
-  await dropdownSearchInput.fill(String(accountName));
+  // Type in the search box
+  const searchInput = page.locator('xap-open-search input').first();
+  await searchInput.waitFor({ timeout: 15000 });
+  await searchInput.click();
+  await searchInput.fill('');
+  await searchInput.type(String(accountName), { delay: 25 });
   await page.waitForTimeout(1000);
 
-  // Click the matching account from the dropdown results
-  const accountItem = page.locator(
-    '.cdk-overlay-pane:visible [role="option"], ' +
-    '.cdk-overlay-pane:visible .mat-mdc-option, ' +
-    '.cdk-overlay-pane:visible [class*="account-item"], ' +
-    '[role="dialog"]:visible [role="option"]'
-  ).filter({ hasText: String(accountName) }).first();
+  // Click the matching result
+  const accountItem = page.locator('gmp-entity-item, [class*="gmp-entity"], [class*="entity-item"]')
+    .filter({ hasText: String(accountName) }).first();
+  await accountItem.waitFor({ timeout: 15000 });
+  await accountItem.click();
 
-  await accountItem.waitFor({ timeout: 20000 });
-  await accountItem.click({ timeout: 15000 });
-  
-  await page.waitForTimeout(2500);
-
-  // Verify we navigated away from the dropdown
-  const stillShowingDropdown = await page.locator('.cdk-overlay-pane:visible').count() > 0;
-  
-  if (stillShowingDropdown) {
-    // Try clicking again
-    await accountItem.click({ timeout: 15000 });
-    await page.waitForTimeout(2000);
-  }
+  await page.waitForTimeout(2000);
+  console.log("✅ Account selected:", accountName);
 }
 
 async function openAdmin(page) {
@@ -940,10 +904,6 @@ async function clickWithRetry(page, locator, attempts = 4) {
   return false;
 }
 
-async function closeAdminSidebarIfOpen(page) {
-  // existing code...
-}
-
 
 
 
@@ -1452,6 +1412,13 @@ console.log('🔍 Looking for container in list view...');
 // Wait for containers to load
 await page.waitForTimeout(2000);
 
+// DEBUG: Take screenshot of home page
+const screenshotPath = require('path').resolve('gtm_home_before_click.png');
+await page.screenshot({ path: screenshotPath, fullPage: true });
+console.log('📸 Screenshot saved to:', screenshotPath);
+
+let clicked = false;
+
 // First, try to find an element that contains EXACTLY the container ID (not partial match)
 const exactMatch = page.locator(`text=/^${containerId}$/`).first();
 
@@ -1473,25 +1440,78 @@ if (await exactMatch.isVisible({ timeout: 5000 }).catch(() => false)) {
     console.log('✅ Clicked nearby link for container');
   }
 } else {
-  console.log('⚠️ Exact match not found, trying container card selectors...');
+  console.log('⚠️ Exact match not found, trying to find container by visible text...');
   
-  // Try finding a card/row that contains the container ID
-  const containerCard = page.locator(
-    `div:has-text("${containerId}")`
-  ).filter(async (el) => {
-    const text = await el.textContent();
-    // Make sure this element actually contains our container ID (not just partial match)
-    return text.includes(containerId);
-  }).first();
+  // GTM displays "GTM-XXXXXXX" as TEXT on the page, but the href uses numeric IDs
+  // So we need to: 1) Find the text "GTM-XXXXXXX", 2) Find the link in that same row
   
-  if (await containerCard.isVisible({ timeout: 5000 }).catch(() => false)) {
-    // Find the first link or button inside this card
-    const clickTarget = containerCard.locator('a, button, [role="link"], [role="button"]').first();
+  // METHOD A: Find the container ID text, then navigate up to the row, then find the link
+  const containerIdText = page.locator(`text="${containerId}"`).first();
+  
+  if (await containerIdText.isVisible({ timeout: 5000 }).catch(() => false)) {
+    console.log(`✅ Found container ID text: ${containerId}`);
     
-    if (await clickTarget.isVisible().catch(() => false)) {
-      await clickTarget.click({ timeout: 10000 });
-      clicked = true;
-      console.log('✅ Clicked link inside container card');
+    // The Container ID is just text, we need to click the Container Name link in the SAME ROW
+    // Strategy: Find all container links, then pick the one that's vertically aligned with the ID
+    
+    const allLinks = await page.locator('a[href*="/container/"]').all();
+    console.log(`📊 Found ${allLinks.length} container links on page`);
+    
+    const idBox = await containerIdText.boundingBox();
+    
+    if (idBox) {
+      console.log(`📍 Container ID position: y=${idBox.y}`);
+      
+      for (const link of allLinks) {
+        const linkBox = await link.boundingBox().catch(() => null);
+        
+        if (linkBox) {
+          const verticalDistance = Math.abs(idBox.y - linkBox.y);
+          
+          // If they're in the same horizontal line (within 30px), they're in the same row
+          if (verticalDistance < 30) {
+            const href = await link.getAttribute('href').catch(() => '');
+            const linkText = await link.textContent().catch(() => '');
+            console.log(`📍 Found link in same row - distance: ${verticalDistance}px`);
+            console.log(`   Link text: "${linkText.substring(0, 40)}"`);
+            console.log(`   Link href: ${href}`);
+            
+            await link.click({ timeout: 10000 });
+            clicked = true;
+            console.log('✅ Clicked container name link');
+            break;
+          }
+        }
+      }
+      
+      if (!clicked) {
+        console.log('⚠️ No link found in same row as Container ID');
+      }
+    }
+  } else {
+    console.log('⚠️ Container ID text not found, trying broader search...');
+    
+    // METHOD B: Search all rows for one containing the container ID
+    const allRows = await page.locator('tr, div[class*="container-item"], div[class*="container-card"]').all();
+    console.log(`📊 Checking ${allRows.length} rows for container ID...`);
+    
+    for (const row of allRows) {
+      const rowText = await row.textContent().catch(() => '');
+      
+      if (rowText.includes(containerId)) {
+        console.log(`✅ Found row containing: ${containerId}`);
+        const link = row.locator('a').first();
+        
+        if (await link.isVisible().catch(() => false)) {
+          const href = await link.getAttribute('href').catch(() => '');
+          console.log(`📍 Clicking link with href: ${href}`);
+          
+          await link.click({ timeout: 10000 });
+          clicked = true;
+          console.log('✅ Clicked container link');
+          break;
+        }
+      }
     }
   }
 }
@@ -1549,6 +1569,14 @@ if (await exactMatch.isVisible({ timeout: 5000 }).catch(() => false)) {
     throw new Error(`Could not find or click container "${containerId}" using any method. Screenshot saved.`);
   }
 
+  // DEBUG: Log what happened after clicking
+  await page.waitForTimeout(2000);
+  console.log('📸 Taking screenshot after click...');
+  const screenshotPath2 = require('path').resolve('gtm_after_click.png');
+  await page.screenshot({ path: screenshotPath2, fullPage: true });
+  console.log('📸 Screenshot saved to:', screenshotPath2);
+  console.log('🔍 Current URL after click:', page.url());
+
   // Verify we're in the container workspace
   console.log('🔍 Verifying container opened...');
 
@@ -1568,7 +1596,7 @@ if (await exactMatch.isVisible({ timeout: 5000 }).catch(() => false)) {
 }
 
 
-
+const sessions = {};
 
 
 app.post('/run', async (req, res) => {
@@ -1588,9 +1616,7 @@ app.post('/run', async (req, res) => {
 console.log('RUN action =', JSON.stringify(action));
 
 
-
-if (!['login_and_create_ga4', 'create_ga_account', 'fetch_gtag_and_property_id', 
-      'check_gtm_capacity', 'create_gtm_account', 'configure_and_publish_gtm'].includes(action)) {
+if (!['login_and_create_ga4', 'create_ga_account', 'fetch_gtag_and_property_id', 'check_gtm_capacity', 'create_gtm_account', 'configure_and_publish_gtm', 'install_gtm_codes', 'add_search_console_property', 'fetch_gtm_codes', 'test_tracking_ctas', 'submit_google_otp'].includes(action)) {
   return res.status(400).json({ error: 'Unknown action' });
 }
 
@@ -1598,7 +1624,7 @@ if (!['login_and_create_ga4', 'create_ga_account', 'fetch_gtag_and_property_id',
   let browser;
 
   try {
-    browser = await chromium.launch({ headless: true });
+    browser = await chromium.launch({ headless: false });
     const context = await browser.newContext({ viewport: { width: 1280, height: 800 } });
     let page = await context.newPage(); // NOTE: changed from const -> let so Step 2 recovery can replace the tab
 
@@ -1636,11 +1662,44 @@ if (!['login_and_create_ga4', 'create_ga_account', 'fetch_gtag_and_property_id',
         }
       }
 
+ //code needed?
+if (await page.locator('input[type="tel"]:visible').count() > 0) {
+    const sessionId = `otp_${Date.now()}`;
+    sessions[sessionId] = page;
+    browser = null;
+    return res.json({ status: 'need_code', stage: 'google_otp', sessionId });
+  }
+
       if (page.url().startsWith('https://analytics.google.com')) break;
       await page.waitForTimeout(3000);
     }
 
-/* ================= ADMIN -> CLOSE LEFT COLUMN -> CREATE -> ACCOUNT ================= */
+
+
+ if (action === 'submit_google_otp') {
+    const { sessionId, otp_code } = req.body;
+    const otpPage = sessions[sessionId];
+    if (!otpPage) return res.json({ status: 'error', message: 'Session not found or expired' });
+
+    try {
+      await otpPage.fill('input[type="tel"]', otp_code);
+      await otpPage.click('button:has-text("Next")');
+      await otpPage.waitForTimeout(3000);
+
+      const needsAnother = await otpPage.$('input[type="tel"]');
+      if (needsAnother) {
+        return res.json({ status: 'need_code', stage: 'otp_retry', sessionId });
+      }
+
+      delete sessions[sessionId];
+      return res.json({ status: 'success', sessionId });
+    } catch (err) {
+      return res.json({ status: 'error', message: err.message });
+    }
+  }
+
+
+
 /* ======================================================
    ACTION 1 — UI NAV (Admin -> Create -> Account) THEN CAPACITY CHECK
 ====================================================== */
@@ -1665,12 +1724,12 @@ if (action === 'login_and_create_ga4') {
   await page.waitForURL(/\/admin\b/i, { timeout: 30000 }).catch(() => {});
   await page.waitForTimeout(1200);
 
-  // 2) Close the left column (your manual “nudge”)
+  // 2) Close the left column (your manual "nudge")
   await page.mouse.click(650, 320).catch(() => {});
   await page.keyboard.press('Escape').catch(() => {});
   await page.waitForTimeout(800);
 
-  // Ensure we’re at top so Create is reachable
+  // Ensure we're at top so Create is reachable
   await page.evaluate(() => window.scrollTo(0, 0));
   await page.waitForTimeout(400);
 
@@ -1709,7 +1768,7 @@ if (action === 'login_and_create_ga4') {
     'text=Monetization'
   ];
 
-  // Limit message detection (so you don’t get stuck on the limit page)
+  // Limit message detection (so you don't get stuck on the limit page)
   const limitIndicators = [
     'text=/reached\\s+the\\s+limit/i',
     'text=/limit\\s+reached/i',
@@ -1819,7 +1878,7 @@ if (action === 'create_ga_account') {
     await page.goto(createUrl, { waitUntil: 'domcontentloaded' });
     await page.waitForTimeout(1500);
 
-    // Your “nudge” to settle UI/focus
+    // Your "nudge" to settle UI/focus
     await page.mouse.click(650, 320).catch(() => {});
     await page.keyboard.press('Escape').catch(() => {});
     await page.waitForTimeout(600);
@@ -2294,7 +2353,7 @@ for (const label of objectiveLabels) {
 
 
 
-// Click Create (don’t require exact accessible name; GA often changes it)
+// Click Create (don't require exact accessible name; GA often changes it)
 const createBtn = page.locator('button:has-text("Create")').last();
 await createBtn.waitFor({ state: 'attached', timeout: 30000 });
 await createBtn.scrollIntoViewIfNeeded().catch(() => {});
@@ -2613,167 +2672,71 @@ if (action === 'check_gtm_capacity') {
     }
   }
 
+
+  // Extract numeric account and container IDs from URL
+  const gtmUrl = page.url();
+  console.log('📍 GTM URL after creation:', gtmUrl);
+  const gtmUrlMatch = gtmUrl.match(/accounts\/(\d+)\/containers\/(\d+)/);
+  if (gtmUrlMatch) {
+    codes.numericAccountId = gtmUrlMatch[1];
+    codes.numericContainerId = gtmUrlMatch[2];
+    console.log('✅ Numeric Account ID:', codes.numericAccountId);
+    console.log('✅ Numeric Container ID:', codes.numericContainerId);
+  } else {
+    console.log('⚠️ Could not extract numeric IDs from URL:', gtmUrl);
+  }
+
   await browser.close();
   return res.json({ 
     status: 'success', 
     reason: 'gtm_has_space',
     codes: codes
   });
+
+  
 }
 
-
 if (action === 'configure_and_publish_gtm') {
-  console.log('🔧 Configuring and publishing GTM container...');
+  console.log('🚀 Publishing GTM container (AP Tracking Setup workspace)...');
 
-  const {
-    gtm_container_id,
-    measurement_id,
-    gtm_google_account
-  } = req.body;
+  const { gtm_container_id, numeric_account_id, numeric_container_id, workspace_id } = req.body;
 
   if (!gtm_container_id) throw new Error('Missing gtm_container_id');
-  if (!measurement_id) throw new Error('Missing measurement_id (GA4)');
+  if (!numeric_account_id || !numeric_container_id || !workspace_id) throw new Error('Missing numeric IDs');
 
-  // Navigate to GTM and handle login if needed
   console.log('🌐 Navigating to Google Tag Manager...');
   await page.goto('https://tagmanager.google.com', { waitUntil: 'domcontentloaded' });
   await page.waitForTimeout(2000);
 
-  // ✅ INLINE LOGIN GUARD (NO HELPERS, DOES NOT TOUCH OTHER ACTIONS)
   for (let i = 0; i < 10; i++) {
-
-    // Google email
     if (await page.locator('input[type="email"]:visible').count().catch(() => 0) > 0) {
       await page.fill('input[type="email"]:visible', google_email);
       await page.keyboard.press('Enter');
       await page.waitForTimeout(4000);
       continue;
     }
-
-    // Google password
     if (await page.locator('input[name="Passwd"]:visible').count().catch(() => 0) > 0) {
       await page.fill('input[name="Passwd"]:visible', google_password);
       await page.keyboard.press('Enter');
       await page.waitForTimeout(5000);
       continue;
     }
-
-    // SSO username (Thrive/OneLogin/etc.)
     if (await page.locator('input[name="username"]:visible').count().catch(() => 0) > 0) {
       await page.fill('input[name="username"]:visible', sso_username || google_email);
       await page.keyboard.press('Enter');
       await page.waitForTimeout(3000);
       continue;
     }
-
-    // SSO password (Thrive/OneLogin/etc.)
     if (await page.locator('input[name="password"]:visible').count().catch(() => 0) > 0) {
       await page.fill('input[name="password"]:visible', sso_password || google_password);
       await page.keyboard.press('Enter');
       await page.waitForTimeout(5000);
       continue;
     }
-
-    // If we're on GTM and no login fields are visible, assume we're logged in
     if (page.url().includes('tagmanager.google.com')) break;
-
     await page.waitForTimeout(1000);
   }
 
-  
-  console.log(`🔍 Opening GTM container from home list: ${gtm_container_id}...`);
-  await openContainerFromHomeList(page, gtm_container_id);
-  console.log('✅ Container opened');
-
-
-
-
-  // Navigate to Tags section
-  console.log('🏷️ Navigating to Tags...');
-  const tagsLink = page.locator(
-    'a:has-text("Tags"), ' +
-    '[role="link"]:has-text("Tags")'
-  ).first();
-
-  await tagsLink.waitFor({ timeout: 30000 });
-  await tagsLink.click({ timeout: 15000 });
-  await page.waitForTimeout(1500);
-
-  // Click "New" to create a new tag
-  console.log('🆕 Creating new tag...');
-  const newBtn = page.locator(
-    'button:has-text("New"), ' +
-    '[aria-label*="New"]'
-  ).first();
-
-  await newBtn.waitFor({ timeout: 30000 });
-  await newBtn.click({ timeout: 15000 });
-  await page.waitForTimeout(1500);
-
-  // Click on "Tag Configuration" to select tag type
-  console.log('⚙️ Opening tag configuration...');
-  const tagConfigBtn = page.locator(
-    'div:has-text("Tag Configuration"), ' +
-    'button:has-text("Tag Configuration"), ' +
-    '[class*="tagConfig"]'
-  ).first();
-
-  await tagConfigBtn.waitFor({ timeout: 30000 });
-  await tagConfigBtn.click({ timeout: 15000 });
-  await page.waitForTimeout(1000);
-
-  // Search for and select "Google Tag" (GA4 Configuration)
-  console.log('🔍 Searching for Google Tag...');
-
-  // Try search input in the tag type selector
-  const searchInput = page.locator(
-    'input[type="text"], ' +
-    'input[placeholder*="Search"], ' +
-    'input[aria-label*="Search"]'
-  ).first();
-
-  if (await searchInput.count() > 0) {
-    await searchInput.fill('Google Tag');
-    await page.waitForTimeout(800);
-  }
-
-  
-
-// Click "Google Tag" option (try multiple variations)
-console.log('🔍 Looking for Google Tag option...');
-
-// Wait for options to appear
-await page.waitForTimeout(1000);
-
-let googleTagOption = page.locator(
-  '[role="option"]:has-text("Google Tag"), ' +
-  'div:has-text("Google Tag"), ' +
-  'button:has-text("Google Tag"), ' +
-  '[class*="option"]:has-text("Google Tag")'
-).first();
-
-// If not found, try "Google Analytics: GA4"
-if (await googleTagOption.count() === 0) {
-  console.log('⚠️ "Google Tag" not found, trying "Google Analytics: GA4"...');
-  googleTagOption = page.locator(
-    '[role="option"]:has-text("Google Analytics: GA4"), ' +
-    'div:has-text("Google Analytics: GA4"), ' +
-    '[role="option"]:has-text("GA4")'
-  ).first();
-}
-
-// If still not found, try just "GA4"
-if (await googleTagOption.count() === 0) {
-  console.log('⚠️ Trying broader "GA4" search...');
-  googleTagOption = page.locator(
-    '[role="option"]:has-text("GA4"), ' +
-    'div:has-text("GA4")'
-  ).first();
-}
-
-await googleTagOption.waitFor({ timeout: 30000 });
-await googleTagOption.click({ timeout: 15000 });
-console.log('✅ Selected Google Tag/GA4 option');
 
 
 
@@ -2787,128 +2750,1414 @@ console.log('✅ Selected Google Tag/GA4 option');
 
 
 
+  // Navigate directly to workspace
+  const workspaceUrl = `https://tagmanager.google.com/#/container/accounts/${numeric_account_id}/containers/${numeric_container_id}/workspaces/${workspace_id}`;
+  console.log('🧭 Navigating directly to workspace:', workspaceUrl);
+  await page.goto(workspaceUrl, { waitUntil: 'domcontentloaded' });
+  await page.waitForTimeout(4000);
+  console.log('✅ On workspace page:', page.url());
 
-  // Fill in the Tag ID (Measurement ID)
-  console.log(`📝 Entering Measurement ID: ${measurement_id}...`);
-  const tagIdInput = page.locator(
-    'input[aria-label*="Tag ID"], ' +
-    'input[placeholder*="G-"], ' +
-    'input[name*="tagId"], ' +
-    'input[name*="measurementId"]'
-  ).first();
-
-  await tagIdInput.waitFor({ timeout: 30000 });
-  await tagIdInput.fill(measurement_id);
+  // Submit
+  console.log('📤 Clicking Submit...');
+  await page.mouse.move(0, 0).catch(() => {});
+  await page.keyboard.press('Escape').catch(() => {});
   await page.waitForTimeout(500);
 
-  // Set up triggering - click on "Triggering" section
-  console.log('🎯 Setting up trigger...');
-  const triggeringBtn = page.locator(
-    'div:has-text("Triggering"), ' +
-    'button:has-text("Triggering"), ' +
-    '[class*="trigger"]'
-  ).first();
-
-  await triggeringBtn.waitFor({ timeout: 30000 });
-  await triggeringBtn.click({ timeout: 15000 });
-  await page.waitForTimeout(1000);
-
-  // Select "All Pages" trigger
-  const allPagesTrigger = page.locator(
-    'div:has-text("All Pages"), ' +
-    '[role="option"]:has-text("All Pages"), ' +
-    'button:has-text("All Pages")'
-  ).filter({ hasText: /^All Pages$/i }).first();
-
-  await allPagesTrigger.waitFor({ timeout: 30000 });
-  await allPagesTrigger.click({ timeout: 15000 });
-  await page.waitForTimeout(1000);
-
-  // Save the tag
-  console.log('💾 Saving tag...');
-  const saveBtn = page.locator(
-    'button:has-text("Save"), ' +
-    '[aria-label*="Save"]'
-  ).first();
-
-  await saveBtn.waitFor({ timeout: 30000 });
-  await saveBtn.click({ timeout: 15000 });
-  await page.waitForTimeout(2000);
-
-  // Now publish the container
-  console.log('📤 Publishing container...');
-
-  // Click "Submit" button in top right
-  const submitBtn = page.locator(
-    'button:has-text("Submit"), ' +
-    '[aria-label*="Submit"]'
-  ).first();
-
-  await submitBtn.waitFor({ timeout: 30000 });
-  await submitBtn.click({ timeout: 15000 });
-  await page.waitForTimeout(1500);
-
-  // Fill in version name and description (optional but recommended)
-  const versionNameInput = page.locator(
-    'input[aria-label*="Version name"], ' +
-    'input[placeholder*="Version name"], ' +
-    'textarea[aria-label*="Version name"]'
-  ).first();
-
-  if (await versionNameInput.count() > 0) {
-    const versionName = `GA4 Setup - ${new Date().toISOString().split('T')[0]}`;
-    await versionNameInput.fill(versionName);
-    console.log(`✅ Version name: ${versionName}`);
-  }
-
-  // Click "Publish" button
-  const publishBtn = page.locator(
-    'button:has-text("Publish"), ' +
-    '[aria-label*="Publish"]'
-  ).first();
-
-  await publishBtn.waitFor({ timeout: 30000 });
-
-  // Wait for publish button to be enabled
-  const startPublish = Date.now();
-  while (Date.now() - startPublish < 15000) {
-    const enabled = await publishBtn.isEnabled().catch(() => false);
-    if (enabled) break;
-    await page.waitForTimeout(300);
-  }
-
-  await publishBtn.click({ timeout: 15000 });
+  const submitBtn = page.locator('button:has-text("Submit"), [aria-label*="Submit"]').first();
+  await submitBtn.waitFor({ state: 'visible', timeout: 30000 });
+  await submitBtn.click({ force: true, timeout: 15000 });
+  console.log('✅ Clicked Submit');
   await page.waitForTimeout(3000);
 
-  // Verify publication success
-  console.log('✅ Verifying publication...');
-  const successIndicator = page.locator(
-    'text=/published/i, ' +
-    'text=/success/i, ' +
-    '[class*="success"]'
-  ).first();
-
-  const published = await successIndicator
-    .waitFor({ timeout: 15000 })
-    .then(() => true)
-    .catch(() => false);
-
-  if (!published) {
-    console.log('⚠️ Could not confirm publication success');
+  const continueBtn = page.locator('button:has-text("Continue"), button:has-text("Skip")').first();
+  if (await continueBtn.isVisible({ timeout: 5000 }).catch(() => false)) {
+    await continueBtn.click({ timeout: 10000 });
+    await page.waitForTimeout(2000);
   }
 
-  console.log('✅ GTM container configured and published');
+  const publishBtn = page.locator('button:has-text("Publish"), [aria-label*="Publish"]').first();
+  await publishBtn.waitFor({ state: 'visible', timeout: 30000 });
+  await publishBtn.click({ timeout: 15000 });
+  console.log('✅ Clicked Publish');
+  await page.waitForTimeout(5000);
 
   await browser.close();
   return res.json({
     status: 'success',
-    message: 'GTM container configured and published',
+    message: 'GTM workspace published',
     gtm_container_id,
-    measurement_id,
+    workspace: 'AP Tracking Setup',
     published: true,
     published_at: new Date().toISOString()
   });
 }
+
+
+
+if (action === 'install_gtm_codes') {
+  console.log('🌐 Installing GTM codes on client website...');
+
+  const {
+    website_url,
+    cms_type, // "wordpress", "wix", or "squarespace"
+    wp_admin_url,
+    cms_username,
+    cms_password,
+    gtm_head_code,
+    gtm_body_code,
+    gtag
+  } = req.body;
+
+  if (!website_url || !cms_type) {
+    throw new Error('Missing website_url or cms_type');
+  }
+
+  if (!gtm_head_code || !gtm_body_code) {
+    throw new Error('Missing GTM codes (gtm_head_code or gtm_body_code)');
+  }
+
+  const cms = cms_type.toLowerCase();
+
+ 
+ // ==================== WORDPRESS ====================
+  if (action === 'install_gtm_codes') {
+  console.log('🌐 Installing GTM codes on client website...');
+
+  const {
+    website_url,
+    cms_type,
+    wp_admin_url,
+    cms_username,
+    cms_password,
+    gtm_head_code,
+    gtm_body_code,
+    gtag
+  } = req.body;
+
+  if (!website_url || !cms_type) {
+    throw new Error('Missing website_url or cms_type');
+  }
+
+  if (!gtm_head_code || !gtm_body_code) {
+    throw new Error('Missing GTM codes (gtm_head_code or gtm_body_code)');
+  }
+
+  const cms = cms_type.toLowerCase();
+
+  // ==================== WORDPRESS ====================
+  
+if (cms === 'wordpress') {
+    console.log('📝 WordPress site detected');
+
+    if (!wp_admin_url || !cms_username || !cms_password) {
+      throw new Error('Missing WordPress credentials');
+    }
+
+    const baseUrl = wp_admin_url.replace(/\/(wp-admin|wp-login\.php).*$/, '').replace(/\/$/, '');
+
+    async function wpAdminGoto(url) {
+      await page.goto(url, { waitUntil: 'domcontentloaded' });
+      await page.waitForTimeout(2000);
+      console.log('📍 Landed on:', page.url());
+
+      const currentUrl = page.url();
+      if (currentUrl.includes('wp-login') || currentUrl.includes('reauth=1') || currentUrl.includes('onelogin')) {
+        console.log('🔄 Session expired, re-logging in...');
+        await page.goto(`${baseUrl}/wp-login.php`, { waitUntil: 'domcontentloaded' });
+        await page.waitForTimeout(1000);
+        await page.locator('#user_login, input[name="log"]').first().fill(cms_username);
+        await page.locator('#user_pass, input[name="pwd"]').first().fill(cms_password);
+        await page.locator('#wp-submit, input[type="submit"]').first().click();
+        await page.waitForURL('**/wp-admin/**', { timeout: 30000 });
+        await page.waitForTimeout(1000);
+        await page.goto(url, { waitUntil: 'domcontentloaded' });
+        await page.waitForTimeout(2000);
+        console.log('✅ Re-logged in, now at:', page.url());
+      }
+    }
+
+    // ── Login ──────────────────────────────────────────────────────────────
+    console.log(`🔐 Logging into WordPress: ${wp_admin_url}`);
+    await page.goto(wp_admin_url, { waitUntil: 'domcontentloaded' });
+    await page.waitForTimeout(2000);
+    await page.locator('#user_login, input[name="log"]').first().fill(cms_username);
+    await page.locator('#user_pass, input[name="pwd"]').first().fill(cms_password);
+    await page.locator('#wp-submit, input[type="submit"]').first().click();
+    await page.waitForURL('**/wp-admin/**', { timeout: 30000 });
+    await page.waitForTimeout(1000);
+    console.log('✅ Logged into WordPress');
+
+    // ── WPCode check ───────────────────────────────────────────────────────
+    console.log('🔌 Checking for WPCode plugin...');
+    await wpAdminGoto(`${baseUrl}/wp-admin/plugins.php`);
+
+    const wpCodeRow = page.locator('tr[data-slug="insert-headers-and-footers"]').first();
+    const pluginExists = await wpCodeRow.count() > 0;
+
+    if (!pluginExists) {
+      console.log('⚠️ WPCode not found, installing...');
+      await wpAdminGoto(`${baseUrl}/wp-admin/plugin-install.php`);
+
+      const searchInput = page.locator('#search-plugins, input[name="s"]').first();
+      await searchInput.waitFor({ timeout: 30000 });
+      await searchInput.fill('WPCode');
+      await page.keyboard.press('Enter');
+      await page.waitForTimeout(3000);
+
+      const installBtn = page.locator('a:has-text("Install Now")').first();
+      await installBtn.waitFor({ timeout: 30000 });
+      await installBtn.click();
+      await page.waitForTimeout(5000);
+      console.log('✅ Plugin installed');
+
+      const activateBtn = page.locator('a:has-text("Activate")').first();
+      await activateBtn.waitFor({ timeout: 30000 });
+      await activateBtn.click();
+      await page.waitForTimeout(3000);
+      console.log('✅ Plugin activated');
+
+    } else {
+      const deactivateLink = wpCodeRow.locator('a:has-text("Deactivate")').first();
+      const activateLink   = wpCodeRow.locator('a:has-text("Activate")').first();
+
+      const isActive   = await deactivateLink.isVisible().catch(() => false);
+      const isInactive = await activateLink.isVisible().catch(() => false);
+
+      if (isActive) {
+        console.log('✅ WPCode already active, leaving it alone');
+      } else if (isInactive) {
+        console.log('⚠️ WPCode inactive, activating...');
+        await activateLink.click();
+        await page.waitForTimeout(3000);
+        console.log('✅ WPCode activated');
+      } else {
+        console.log('⚠️ Could not determine WPCode state, proceeding anyway...');
+      }
+    }
+
+    // ── Insert GTM codes ───────────────────────────────────────────────────
+    console.log('⚙️ Opening WPCode Header & Footer...');
+    await wpAdminGoto(`${baseUrl}/wp-admin/admin.php?page=wpcode-headers-footers`);
+
+    console.log('📝 Inserting GTM codes (appending if existing content found)...');
+    await page.evaluate((codes) => {
+      const editors = document.querySelectorAll('.CodeMirror');
+
+      if (editors[0] && editors[0].CodeMirror) {
+        const headEditor   = editors[0].CodeMirror;
+        const existingHead = headEditor.getValue().trim();
+        const newHead      = (codes.gtag ? codes.gtag + '\n' : '') + codes.head;
+        headEditor.setValue(existingHead ? existingHead + '\n\n' + newHead : newHead);
+      }
+
+      if (editors[1] && editors[1].CodeMirror) {
+        const bodyEditor   = editors[1].CodeMirror;
+        const existingBody = bodyEditor.getValue().trim();
+        bodyEditor.setValue(existingBody ? existingBody + '\n\n' + codes.body : codes.body);
+      }
+    }, { head: gtm_head_code, body: gtm_body_code, gtag: gtag || '' });
+
+    console.log('✅ Head code inserted');
+    console.log('✅ Body code inserted');
+
+    const saveBtn = page.locator('button:has-text("Save Changes"), input[type="submit"]').first();
+    await saveBtn.click();
+    await page.waitForTimeout(2000);
+    console.log('✅ GTM codes saved');
+
+    // ── Form detection ─────────────────────────────────────────────────────
+    // ── Form detection ─────────────────────────────────────────────────────
+    console.log('🔍 Detecting contact form provider...');
+
+    const siteBaseUrl = website_url.replace(/\/$/, '');
+
+    async function safeGotoForm(url, label = 'page') {
+      try {
+        console.log(`🔎 Checking ${label}: ${url}`);
+        await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 20000 });
+        await page.waitForTimeout(2000);
+        return true;
+      } catch (err) {
+        console.log(`⚠️ Could not load ${url}: ${err.message}`);
+        return false;
+      }
+    }
+
+    function dedupeUrls(urls) {
+      return [...new Set(urls.filter(Boolean))];
+    }
+
+    const pagesToCheck = dedupeUrls([
+      siteBaseUrl,
+      siteBaseUrl + '/contact',
+      siteBaseUrl + '/contact-us',
+      siteBaseUrl + '/contact-me',
+      siteBaseUrl + '/contactus',
+      siteBaseUrl + '/get-in-touch',
+      siteBaseUrl + '/getintouch',
+      siteBaseUrl + '/enquiry',
+      siteBaseUrl + '/enquiries',
+      siteBaseUrl + '/enquire',
+      siteBaseUrl + '/make-an-enquiry',
+      siteBaseUrl + '/quote',
+      siteBaseUrl + '/free-quote',
+      siteBaseUrl + '/get-a-quote',
+      siteBaseUrl + '/request-a-quote',
+      siteBaseUrl + '/request-quote',
+      siteBaseUrl + '/book',
+      siteBaseUrl + '/book-now',
+      siteBaseUrl + '/booking',
+      siteBaseUrl + '/bookings',
+      siteBaseUrl + '/support',
+      siteBaseUrl + '/help',
+      siteBaseUrl + '/reach-us',
+      siteBaseUrl + '/reach-out',
+      siteBaseUrl + '/talk-to-us',
+      siteBaseUrl + '/speak-to-us',
+      siteBaseUrl + '/hire-us',
+      siteBaseUrl + '/work-with-us',
+      siteBaseUrl + '/sales',
+      siteBaseUrl + '/demo',
+      siteBaseUrl + '/request-demo',
+      siteBaseUrl + '/free-consultation',
+      siteBaseUrl + '/consultation',
+    ]);
+
+    console.log('📄 Pages to check:', pagesToCheck.join(', '));
+
+    let detected_form_type = 'unknown';
+    let detected_form_id = null;
+    let detected_form_class = null;
+    let detected_form_selector = null;
+    let detected_form_action = null;
+    let detected_form_source_url = null;
+
+    async function detectBestFormOnPage(pageOrFrame) {
+      return await pageOrFrame.evaluate(() => {
+        const normaliseClass = (value) => {
+          if (!value || typeof value !== 'string') return null;
+          const cleaned = value.trim().replace(/\s+/g, ' ');
+          return cleaned || null;
+        };
+
+        const getPluginType = (form) => {
+          const wrapper = form.closest(
+            '.wpcf7, .gform_wrapper, .wpforms-container, .elementor-widget, .et_pb_contact, .fluentform, .forminator, .nf-form-cont, .frm_forms, .hs-form, .metform-form-main-wrapper, .gutena-forms-block, .wp-block-gutena-forms'
+          );
+          const formClass = `${form.className || ''} ${wrapper?.className || ''}`.toLowerCase();
+          const formId = (form.id || '').toLowerCase();
+          const action = (form.getAttribute('action') || '').toLowerCase();
+
+          if (form.matches('form.wp-block-gutena-forms') || formClass.includes('gutena') || action.includes('gutena')) return 'gutenaforms';
+          if (form.matches('.wpcf7-form, form.wpcf7') || formClass.includes('wpcf7')) return 'cf7';
+          if (form.matches('form[id^="gform_"]') || formId.startsWith('gform_') || formClass.includes('gform_wrapper') || formClass.includes('gravity')) return 'gform';
+          if (form.matches('form.elementor-form, .elementor-form') || formClass.includes('elementor-form')) return 'elementor';
+          if (form.matches('form[id^="wpforms-form-"], .wpforms-form') || formId.startsWith('wpforms-form-') || formClass.includes('wpforms')) return 'wpforms';
+          if (formClass.includes('et_pb_contact_form') || formClass.includes('et_pb_contact')) return 'divi';
+          if (formClass.includes('hs-form') || action.includes('hubspot')) return 'hubspot';
+          if (formClass.includes('wsf-form')) return 'wsform';
+          if (formClass.includes('sqs-block-form')) return 'squarespace';
+          if (formClass.includes('metform')) return 'metform';
+          if (formClass.includes('ninja-forms') || formClass.includes('nf-form')) return 'ninjaforms';
+          if (formClass.includes('formidable') || formClass.includes('frm_form')) return 'formidable';
+          if (formClass.includes('caldera')) return 'caldera';
+          if (formClass.includes('fluentform') || formClass.includes('ff-el-form')) return 'fluentforms';
+          if (formClass.includes('10web') || formClass.includes('wd-form')) return '10webforms';
+          return 'generic';
+        };
+
+        const buildSelector = (form) => {
+          if (form.id) return `#${form.id}`;
+          const classes = (form.className || '').split(/\s+/).map(c => c.trim()).filter(Boolean);
+          const priorityPatterns = ['wpcf7-form', 'elementor-form', 'wpforms-form', 'gform', 'gutena', 'forminator', 'fluentform', 'nf-form', 'ninja', 'frm_form', 'formidable', 'metform', 'wsf-form', 'hs-form', 'et_pb_contact'];
+          const matched = classes.find(cls => priorityPatterns.some(pattern => cls.toLowerCase().includes(pattern)));
+          if (matched) return `.${matched}`;
+          if (classes.length) return `.${classes[0]}`;
+          return 'form';
+        };
+
+        const scoreForm = (form) => {
+          let score = 0;
+          const id = (form.id || '').toLowerCase();
+          const cls = (form.className || '').toLowerCase();
+          const action = (form.getAttribute('action') || '').toLowerCase();
+          const text = (form.innerText || '').toLowerCase();
+
+          // Exclude admin/search forms
+          if (id.includes('adminbarsearch') || id.includes('search') ||
+              cls.includes('search-form') || action.includes('wp-login')) return -999;
+
+          const hasEmail = !!form.querySelector('input[type="email"], input[name*="email" i]');
+          const hasName = !!form.querySelector('input[name*="name" i], input[placeholder*="name" i], input[id*="name" i]');
+          const hasTextarea = !!form.querySelector('textarea');
+          const hasPhone = !!form.querySelector('input[type="tel"], input[name*="phone" i]');
+          const hasSubmit = !!form.querySelector('button[type="submit"], input[type="submit"], button');
+          const fieldCount = form.querySelectorAll('input, textarea, select').length;
+
+          if (hasEmail) score += 3;
+          if (hasName) score += 2;
+          if (hasTextarea) score += 3;
+          if (hasPhone) score += 1;
+          if (hasSubmit) score += 3;
+          if (fieldCount >= 3) score += 2;
+          if (/contact|enquir|quote|support|get in touch|message|book|request/.test(text)) score += 3;
+          if (/contact|enquir|quote|support|lead|submit/.test(action)) score += 2;
+          if (/contact|enquir|quote|support|form|lead/.test(cls)) score += 2;
+          if (/contact|enquir|quote|support|form/.test(id)) score += 2;
+          if (form.offsetParent === null) score -= 3;
+
+          return score;
+        };
+
+        const forms = Array.from(document.querySelectorAll('form'));
+        if (!forms.length) return null;
+
+        const candidates = forms.map(form => ({
+          type: getPluginType(form),
+          score: scoreForm(form),
+          form_id: form.id || null,
+          form_class: normaliseClass(form.className),
+          form_action: form.getAttribute('action') || null,
+          selector: buildSelector(form)
+        })).filter(c => c.score > 0);
+
+        candidates.sort((a, b) => {
+          const aNamed = a.type !== 'generic' ? 1 : 0;
+          const bNamed = b.type !== 'generic' ? 1 : 0;
+          if (bNamed !== aNamed) return bNamed - aNamed;
+          return b.score - a.score;
+        });
+
+        const best = candidates[0];
+        if (!best) return null;
+        if (best.score < 3 && best.type === 'generic') return null;
+        return best;
+      });
+    }
+
+    for (const pageUrl of pagesToCheck) {
+      const loaded = await safeGotoForm(pageUrl);
+      if (!loaded) continue;
+
+      let formMeta = await detectBestFormOnPage(page);
+
+      if (formMeta) {
+        detected_form_type = formMeta.type;
+        detected_form_id = formMeta.form_id;
+        detected_form_class = formMeta.form_class;
+        detected_form_selector = formMeta.selector;
+        detected_form_action = formMeta.form_action;
+        detected_form_source_url = pageUrl;
+        console.log(`✅ Form detected on ${pageUrl}: ${formMeta.type} | selector: ${formMeta.selector} | id: ${formMeta.form_id}`);
+        break;
+      }
+
+      for (const frame of page.frames()) {
+        try {
+          if (frame === page.mainFrame()) continue;
+          const frameMeta = await detectBestFormOnPage(frame);
+          if (!frameMeta) continue;
+          detected_form_type = frameMeta.type;
+          detected_form_id = frameMeta.form_id;
+          detected_form_class = frameMeta.form_class;
+          detected_form_selector = frameMeta.selector;
+          detected_form_action = frameMeta.form_action;
+          detected_form_source_url = pageUrl;
+          console.log(`✅ Frame-based form detected on ${pageUrl}: ${frameMeta.type} | selector: ${frameMeta.selector}`);
+          break;
+        } catch (err) {
+          console.log(`⚠️ Frame inspection failed on ${pageUrl}: ${err.message}`);
+        }
+      }
+
+      if (detected_form_type !== 'unknown') break;
+      console.log(`⚠️ No form detected on ${pageUrl}`);
+    }
+
+    console.log(`📋 Final detected form type: ${detected_form_type}`);
+    console.log(`📋 Final selector: ${detected_form_selector}`);
+    console.log(`📋 Final source url: ${detected_form_source_url}`);
+    console.log('✅ GTM codes installed on WordPress site');
+
+    return res.json({
+      success: true,
+      message: 'GTM codes installed successfully',
+      detected_form_type,
+      detected_form_id,
+      detected_form_class,
+      detected_form_selector,
+      detected_form_action,
+      detected_form_source_url
+    });
+  }
+}
+
+
+
+
+
+
+  // ==================== WIX ====================
+ else if (cms === 'wix') {
+    console.log('📝 Wix site detected');
+
+    if (!cms_username || !cms_password) {
+      throw new Error('Missing Wix credentials');
+    }
+
+    // Login to Wix
+    console.log('🔐 Logging into Wix...');
+    await page.goto('https://users.wix.com/signin', { waitUntil: 'domcontentloaded' });
+    await page.waitForTimeout(2000);
+
+    const emailInput = page.locator('input[type="email"], input[name="email"]').first();
+    await emailInput.waitFor({ timeout: 30000 });
+    await emailInput.fill(cms_username);
+    await page.keyboard.press('Enter');
+    await page.waitForTimeout(2000);
+
+    const passwordInput = page.locator('input[type="password"], input[name="password"]').first();
+    await passwordInput.waitFor({ timeout: 30000 });
+    await passwordInput.fill(cms_password);
+    await page.keyboard.press('Enter');
+    console.log('✅ Logged into Wix');
+    await page.waitForTimeout(5000);
+    
+
+// ── Navigate to Sites dashboard ──────────────────────────────────────
+  console.log('🔍 Navigating to Sites dashboard...');
+  await page.goto(
+    'https://manage.wix.com/studio/sites?referralInfo=sidebar&viewId=all-items-view',
+    { waitUntil: 'domcontentloaded' }
+  );
+  await page.waitForLoadState('networkidle', { timeout: 20000 }).catch(() => {});
+  await page.waitForTimeout(8000);
+
+  // ── Extract domain ───────────────────────────────────────────────────
+  function getDomain(input) {
+    try {
+      const u = new URL(input.startsWith('http') ? input : `https://${input}`);
+      return u.hostname.replace(/^www\./, '').toLowerCase();
+    } catch {
+      return String(input).replace(/^https?:\/\//, '').replace(/^www\./, '').split('/')[0].toLowerCase();
+    }
+  }
+  function escapeRegExp(s) {
+    return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  }
+
+  const targetDomain = getDomain(website_url);
+  console.log(`🔍 Searching for domain: ${targetDomain}`);
+
+  // ── Search for site ──────────────────────────────────────────────────
+  const searchInput = page.locator('input[placeholder*="Search"], input[aria-label*="Search"]').first();
+  await searchInput.waitFor({ timeout: 20000 });
+  await searchInput.click().catch(() => {});
+  await page.keyboard.press('Control+A');
+  await page.keyboard.press('Backspace');
+  await searchInput.fill(targetDomain);
+  await page.keyboard.press('Enter');
+  await page.waitForTimeout(2000);
+
+  // ── Find domain text on page ─────────────────────────────────────────
+  let matchText = page.locator(`text=/\\b${escapeRegExp(targetDomain)}\\b/i`).first();
+
+  if (!(await matchText.count())) {
+    const key = targetDomain.split('.')[0];
+    console.log(`⚠️ Falling back to key: ${key}`);
+    await searchInput.click().catch(() => {});
+    await page.keyboard.press('Control+A');
+    await page.keyboard.press('Backspace');
+    await searchInput.fill(key);
+    await page.keyboard.press('Enter');
+    await page.waitForTimeout(2000);
+    matchText = page.locator(`text=/\\b${escapeRegExp(key)}\\b/i`).first();
+  }
+
+
+await matchText.waitFor({ timeout: 20000 });
+console.log('✅ Found site on dashboard');
+
+// Find all text matches and pick the one in the card (not the search bar)
+const allMatches = await page.locator(`text=/${escapeRegExp(targetDomain.split('.')[0])}/i`).all();
+console.log(`🔍 Found ${allMatches.length} matches`);
+
+let cardBox = null;
+for (const el of allMatches) {
+  const box = await el.boundingBox();
+  console.log(`  📍 y=${box?.y}`);
+  if (box && box.y > 200) {
+    cardBox = box;
+    break;
+  }
+}
+
+if (!cardBox) throw new Error('❌ Could not find card on page');
+console.log(`✅ Card found at x=${cardBox.x}, y=${cardBox.y}`);
+
+// Click the dots button - it's to the right of the domain text
+await page.mouse.click(cardBox.x + 170, cardBox.y);
+await page.waitForTimeout(1500);
+await page.screenshot({ path: 'C:\\Users\\esther.bardi\\ga-automation\\hover-debug3.png' });
+
+
+const menuOption = page.locator('text="Edit Site"')
+  .or(page.locator('text="Manage Site"'))
+  .or(page.locator('text="Dashboard"'))
+  .first();
+
+await menuOption.waitFor({ timeout: 8000 });
+await menuOption.click();
+await page.waitForTimeout(4000);
+
+
+
+
+const allPages = page.context().pages();
+const activePage = allPages[allPages.length - 1];
+console.log('📍 Now on:', activePage.url());
+
+await activePage.waitForLoadState('domcontentloaded', { timeout: 20000 }).catch(() => {});
+await activePage.waitForTimeout(2000);
+
+const currentUrl = activePage.url();
+console.log('📍 Now on:', currentUrl);
+
+// Extract metaSiteId from editor URL
+const metaSiteIdMatch = currentUrl.match(/metaSiteId=([a-f0-9-]{36})/i) 
+  || currentUrl.match(/\/([a-f0-9-]{36})/i);
+
+if (!metaSiteIdMatch) throw new Error('❌ Could not extract site ID from: ' + currentUrl);
+
+const metaSiteId = metaSiteIdMatch[1];
+console.log('✅ Got site ID:', metaSiteId);
+
+
+const settingsUrl = `https://manage.wix.com/dashboard/${metaSiteId}/settings`;
+console.log('⚙️ Going to Settings:', settingsUrl);
+await activePage.goto(settingsUrl, { waitUntil: 'domcontentloaded' });
+await activePage.waitForTimeout(4000);
+console.log('📍 Now on:', activePage.url());
+
+// Scroll and find Marketing Integrations in the right panel
+console.log('🔍 Looking for Marketing Integrations...');
+const marketingLink = activePage.locator('text="Marketing Integrations"').first();
+
+for (let i = 0; i < 10; i++) {
+  const visible = await marketingLink.isVisible().catch(() => false);
+  if (visible) break;
+  await activePage.evaluate(() => window.scrollBy(0, 300));
+  await activePage.waitForTimeout(500);
+}
+
+await marketingLink.waitFor({ timeout: 10000 });
+await marketingLink.click();
+console.log('✅ Clicked Marketing Integrations');
+await activePage.waitForTimeout(3000);
+console.log('📍 Now on:', activePage.url());
+
+
+// Extract GTM ID from script
+const gtmIdMatch = gtm_head_code.match(/GTM-[A-Z0-9]+/);
+if (!gtmIdMatch) throw new Error('❌ Could not extract GTM ID from gtm_head_code');
+const gtmId = gtmIdMatch[0];
+console.log('✅ Extracted GTM ID:', gtmId);
+
+// Find the GTM card and click its Connect button
+console.log('🔌 Clicking Connect under Google Tag Manager...');
+const gtmSection = activePage.locator('text="Google Tag Manager"').locator('xpath=ancestor::div[3]');
+const connectBtn = gtmSection.locator('button:has-text("Connect")').first();
+await connectBtn.waitFor({ timeout: 10000 });
+await connectBtn.click();
+await activePage.waitForTimeout(3000);
+
+// Now click "Add Google Tag Manager" button on the next page
+console.log('➕ Clicking Add Google Tag Manager...');
+const addGtmBtn = activePage.locator('button:has-text("Add Google Tag Manager")').first();
+await addGtmBtn.waitFor({ timeout: 10000 });
+await addGtmBtn.click();
+await activePage.waitForTimeout(3000);
+await activePage.screenshot({ path: 'C:\\Users\\esther.bardi\\ga-automation\\gtm-input.png' });
+
+// Enter GTM ID
+console.log('📝 Entering GTM ID:', gtmId);
+const gtmInput = activePage.locator('input').first();
+await gtmInput.waitFor({ timeout: 10000 });
+await gtmInput.fill(gtmId);
+await activePage.waitForTimeout(1000);
+
+// Save
+const gtmSaveBtn = activePage.locator('button:has-text("Save")')
+  .or(activePage.locator('button:has-text("Apply")'))
+  .or(activePage.locator('button:has-text("Add")'))
+  .first();
+await gtmSaveBtn.waitFor({ timeout: 10000 });
+await gtmSaveBtn.click();
+await activePage.waitForTimeout(3000);
+console.log('✅ GTM connected on Wix site');
+
+
+    console.log('✅ GTM codes installed on Wix site');
+  }
+
+  // ==================== SQUARESPACE ====================
+  else if (cms === 'squarespace') {
+    console.log('📝 Squarespace site detected');
+
+    if (!cms_username || !cms_password) {
+      throw new Error('Missing Squarespace credentials');
+    }
+
+    // Login to Squarespace
+    console.log('🔐 Logging into Squarespace...');
+    await page.goto('https://login.squarespace.com/', { waitUntil: 'domcontentloaded' });
+    await page.waitForTimeout(2000);
+
+    const emailInput = page.locator('input[type="email"], input[name="email"]').first();
+    await emailInput.waitFor({ timeout: 30000 });
+    await emailInput.fill(cms_username);
+
+    const passwordInput = page.locator('input[type="password"], input[name="password"]').first();
+    await passwordInput.fill(cms_password);
+
+    const loginBtn = page.locator('button[type="submit"], input[type="submit"]').first();
+    await loginBtn.click();
+    console.log('✅ Logged into Squarespace');
+    await page.waitForTimeout(5000);
+
+    // Navigate to website
+    console.log('🔍 Opening website dashboard...');
+    const siteLink = page.locator(`a:has-text("${website_url}"), [href*="${website_url.replace('https://', '').replace('http://', '')}"]`).first();
+    
+    if (await siteLink.isVisible({ timeout: 10000 }).catch(() => false)) {
+      await siteLink.click();
+      await page.waitForTimeout(3000);
+    }
+
+    // Go to Settings > Advanced > Code Injection
+    console.log('⚙️ Opening Code Injection settings...');
+    
+    const settingsBtn = page.locator('a:has-text("Settings"), button:has-text("Settings")').first();
+    await settingsBtn.waitFor({ timeout: 30000 });
+    await settingsBtn.click();
+    await page.waitForTimeout(2000);
+
+    const advancedLink = page.locator('a:has-text("Advanced"), button:has-text("Advanced")').first();
+    await advancedLink.click();
+    await page.waitForTimeout(2000);
+
+    const codeInjectionLink = page.locator('a:has-text("Code Injection"), button:has-text("Code Injection")').first();
+    await codeInjectionLink.waitFor({ timeout: 30000 });
+    await codeInjectionLink.click();
+    await page.waitForTimeout(2000);
+
+    // Insert GTM codes
+    console.log('📝 Inserting GTM codes...');
+
+    // Header code
+    const headerTextarea = page.locator('textarea[name*="header"], textarea[placeholder*="header"], .CodeMirror').first();
+    await headerTextarea.waitFor({ timeout: 30000 });
+    
+    // For CodeMirror editor (Squarespace uses this)
+    if (await page.locator('.CodeMirror').count() > 0) {
+      await page.evaluate((code) => {
+        const cm = document.querySelector('.CodeMirror').CodeMirror;
+        cm.setValue(code);
+      }, gtm_head_code);
+    } else {
+      await headerTextarea.fill(gtm_head_code);
+    }
+    console.log('✅ Head code inserted');
+
+    // Footer/Body code
+    const footerTextarea = page.locator('textarea[name*="footer"], textarea[placeholder*="footer"]').first();
+    await footerTextarea.fill(gtm_body_code);
+    console.log('✅ Body code inserted');
+
+    // Save
+    const saveBtn = page.locator('button:has-text("Save"), input[value="Save"]').first();
+    await saveBtn.click();
+    await page.waitForTimeout(3000);
+
+    console.log('✅ GTM codes installed on Squarespace site');
+  }
+
+  else {
+    throw new Error(`Unknown CMS type: ${cms_type}`);
+  }
+
+  await browser.close();
+  return res.json({
+    status: 'success',
+    message: `GTM codes installed on ${cms_type} site`,
+    website_url,
+    cms_type,
+    installed_at: new Date().toISOString()
+  });
+}
+
+
+
+
+if (action === 'add_search_console_property') {
+  console.log('🔍 Adding Search Console property...');
+
+  const { website_url, wp_admin_url, cms_username, cms_password } = req.body;
+
+  if (!website_url) throw new Error('Missing website_url');
+  if (!wp_admin_url || !cms_username || !cms_password) throw new Error('Missing WordPress credentials');
+
+  const baseUrl = wp_admin_url.replace(/\/(wp-admin|wp-login\.php).*$/, '').replace(/\/$/, '');
+
+ // ── STEP 1: Go to Search Console and add URL prefix property ──────────
+console.log('📍 Opening Search Console...');
+await page.goto('https://search.google.com/search-console/welcome', { waitUntil: 'domcontentloaded' });
+await page.waitForLoadState('networkidle');
+await page.waitForTimeout(2500);
+
+// Wait for the welcome screen
+await page.locator('text=Welcome to Google Search Console').first().waitFor({ timeout: 20000 });
+
+// Find the "URL prefix" section/card
+const urlPrefixHeading = page.locator('text=URL prefix').first();
+await urlPrefixHeading.waitFor({ state: 'visible', timeout: 20000 });
+
+// Climb to a container and find a usable input inside it
+const urlPrefixCard = urlPrefixHeading.locator('xpath=ancestor::*[self::div or self::section][1]');
+let urlInput = urlPrefixCard.locator('input:not([disabled]):not([aria-hidden="true"])').last();
+
+// Fallback: search globally for visible, enabled inputs and choose the one that looks like the property field
+if (!(await urlInput.isVisible().catch(() => false))) {
+  const inputs = page.locator('input:not([disabled]):not([aria-hidden="true"])');
+  const count = await inputs.count();
+
+  let found = null;
+  for (let i = 0; i < count; i++) {
+    const input = inputs.nth(i);
+    const visible = await input.isVisible().catch(() => false);
+    if (!visible) continue;
+
+    const val = await input.inputValue().catch(() => '');
+    const type = await input.getAttribute('type').catch(() => '');
+    const placeholder = await input.getAttribute('placeholder').catch(() => '');
+
+    // ignore search bars / hidden-ish utility inputs
+    if (type === 'hidden') continue;
+    if ((val || '').includes('Inspect any URL')) continue;
+
+    found = input;
+  }
+
+  if (!found) throw new Error('Could not find a usable Search Console URL prefix input');
+  urlInput = found;
+}
+
+await urlInput.waitFor({ state: 'visible', timeout: 10000 });
+await urlInput.click({ force: true });
+await urlInput.fill(website_url);
+console.log('✅ Filled site URL:', website_url);
+
+// Prefer Enter rather than ambiguous Continue buttons
+await urlInput.press('Enter');
+await page.waitForTimeout(5000);
+
+ 
+ 
+
+// ── STEP 2: Wait for verification result / handle auto-verify / fallback to HTML tag ─────
+console.log('🔍 Waiting for Search Console verification state...');
+await page.waitForTimeout(5000);
+
+const verificationStateText = await page.evaluate(() => document.body.innerText || '');
+console.log('📄 Verification screen text:', verificationStateText.substring(0, 2000));
+
+// Case 1: auto-verified or already verified
+if (
+  verificationStateText.includes('Ownership auto verified') ||
+  verificationStateText.includes('Ownership verified') ||
+  verificationStateText.includes('Property verified') ||
+  verificationStateText.includes('You are a verified owner') ||
+  verificationStateText.includes('Google Analytics, Google Tag Manager')
+) {
+  console.log('✅ Search Console property verified automatically');
+
+  const goToPropertyBtn = page.locator('button:has-text("GO TO PROPERTY"), button:has-text("Go to property")').first();
+  if (await goToPropertyBtn.isVisible().catch(() => false)) {
+    await goToPropertyBtn.click().catch(() => {});
+  } else {
+    const doneBtn = page.locator('button:has-text("DONE"), button:has-text("Done")').first();
+    if (await doneBtn.isVisible().catch(() => false)) {
+      await doneBtn.click().catch(() => {});
+    }
+  }
+
+  await browser.close();
+
+  return res.json({
+    status: 'success',
+    message: 'Search Console property added and auto-verified',
+    website_url,
+    verified: true,
+    method: 'auto_verified'
+  });
+}
+
+// Case 2: not auto-verified, use HTML tag
+console.log('🔍 Property not auto-verified — looking for HTML tag method...');
+await page.waitForTimeout(3000);
+
+// Open "Other verification methods" first if present
+const otherMethods = page.locator('text=Other verification methods').first();
+if (await otherMethods.isVisible().catch(() => false)) {
+  await otherMethods.click({ force: true }).catch(() => {});
+  await page.waitForTimeout(2000);
+}
+
+// Open HTML tag section if present
+const htmlTagSection = page.locator('text=HTML tag').first();
+if (await htmlTagSection.isVisible().catch(() => false)) {
+  await htmlTagSection.click({ force: true }).catch(() => {});
+  await page.waitForTimeout(2000);
+}
+
+// Extract the HTML meta verification tag
+console.log('🔍 Extracting HTML meta verification tag...');
+const metaTagText = await page.evaluate(() => {
+  const selectors = [
+    'code',
+    'input[readonly]',
+    'textarea[readonly]',
+    '[role="textbox"]'
+  ];
+
+  for (const selector of selectors) {
+    const els = document.querySelectorAll(selector);
+    for (const el of els) {
+      const text = el.value || el.textContent || '';
+      if (text.includes('google-site-verification')) {
+        return text.trim();
+      }
+    }
+  }
+
+  const bodyText = document.body.innerText || '';
+  const match = bodyText.match(/<meta name="google-site-verification"[^>]+>/i);
+  return match ? match[0] : null;
+});
+
+if (!metaTagText) {
+  const debugSnippet = await page.evaluate(() => (document.body.innerText || '').substring(0, 2000));
+  console.log('❌ Could not extract meta tag. Page text snippet:', debugSnippet);
+  throw new Error('Could not extract meta verification tag from Search Console');
+}
+
+console.log('✅ Got meta tag:', metaTagText);
+
+const contentMatch = metaTagText.match(/content="([^"]+)"/);
+if (!contentMatch) throw new Error('Could not parse content value from meta tag');
+
+const verificationCode = contentMatch[1];
+const metaTag = `<meta name="google-site-verification" content="${verificationCode}" />`;
+
+  // ── STEP 3: Log into WordPress ─────────────────────────────────────────
+  console.log('🔐 Logging into WordPress...');
+  const wpPage = await browser.newPage();
+  await wpPage.goto(wp_admin_url, { waitUntil: 'domcontentloaded' });
+  await wpPage.waitForTimeout(2000);
+
+  // Re-login helper for session expiry
+  async function wpGoto(url) {
+    await wpPage.goto(url, { waitUntil: 'domcontentloaded' });
+    await wpPage.waitForTimeout(2000);
+    const currentUrl = wpPage.url();
+    if (currentUrl.includes('wp-login') || currentUrl.includes('reauth=1')) {
+      console.log('🔄 WP session expired, re-logging in...');
+      await wpPage.goto(`${baseUrl}/wp-login.php`, { waitUntil: 'domcontentloaded' });
+      await wpPage.locator('#user_login, input[name="log"]').first().fill(cms_username);
+      await wpPage.locator('#user_pass, input[name="pwd"]').first().fill(cms_password);
+      await wpPage.locator('#wp-submit, input[type="submit"]').first().click();
+      await wpPage.waitForURL('**/wp-admin/**', { timeout: 30000 });
+      await wpPage.waitForTimeout(1000);
+      await wpPage.goto(url, { waitUntil: 'domcontentloaded' });
+      await wpPage.waitForTimeout(2000);
+    }
+  }
+
+  await wpPage.locator('#user_login, input[name="log"]').first().waitFor({ timeout: 30000 });
+  await wpPage.locator('#user_login, input[name="log"]').first().fill(cms_username);
+  await wpPage.locator('#user_pass, input[name="pwd"]').first().fill(cms_password);
+  await wpPage.locator('#wp-submit, input[type="submit"]').first().click();
+  await wpPage.waitForURL('**/wp-admin/**', { timeout: 30000 });
+  await wpPage.waitForTimeout(1000);
+  console.log('✅ Logged into WordPress');
+
+  // ── STEP 4: Install/activate WPCode (same pattern as install_gtm_codes) ─
+  console.log('🔌 Checking for WPCode plugin...');
+  await wpGoto(`${baseUrl}/wp-admin/plugins.php`);
+
+  const wpCodeRow = wpPage.locator('tr[data-slug="insert-headers-and-footers"]').first();
+  const pluginExists = await wpCodeRow.count() > 0;
+
+  if (!pluginExists) {
+    console.log('⚠️ WPCode not found, installing...');
+    await wpGoto(`${baseUrl}/wp-admin/plugin-install.php`);
+
+    const searchInput = wpPage.locator('#search-plugins, input[name="s"]').first();
+    await searchInput.waitFor({ timeout: 30000 });
+    await searchInput.fill('WPCode');
+    await wpPage.keyboard.press('Enter');
+    await wpPage.waitForTimeout(3000);
+
+    const installBtn = wpPage.locator('a:has-text("Install Now")').first();
+    await installBtn.waitFor({ timeout: 30000 });
+    await installBtn.click();
+    console.log('✅ Plugin installed');
+    await wpPage.waitForTimeout(5000);
+
+    const activateBtn = wpPage.locator('a:has-text("Activate")').first();
+    await activateBtn.waitFor({ timeout: 30000 });
+    await activateBtn.click();
+    console.log('✅ Plugin activated');
+    await wpPage.waitForTimeout(3000);
+
+  } else {
+    console.log('✅ WPCode found');
+    const activateLink = wpCodeRow.locator('a:has-text("Activate")').first();
+    const isInactive = await activateLink.isVisible().catch(() => false);
+
+    if (isInactive) {
+      console.log('⚠️ Activating WPCode...');
+      await activateLink.click();
+      await wpPage.waitForTimeout(3000);
+      console.log('✅ Plugin activated');
+    } else {
+      console.log('✅ WPCode already active');
+    }
+  }
+
+  // ── STEP 5: Inject meta tag into <head> via WPCode ─────────────────────
+  console.log('⚙️ Opening WPCode Header & Footer...');
+  await wpGoto(`${baseUrl}/wp-admin/admin.php?page=wpcode-headers-footers`);
+
+  // Read existing head content so we don't wipe GTM codes
+  const existingHead = await wpPage.evaluate(() => {
+    const editors = document.querySelectorAll('.CodeMirror');
+    return editors[0] && editors[0].CodeMirror ? editors[0].CodeMirror.getValue() : '';
+  });
+
+  if (existingHead.includes('google-site-verification')) {
+    console.log('ℹ️ Verification tag already in head, skipping injection');
+  } else {
+    const newHeadContent = existingHead ? existingHead + '\n' + metaTag : metaTag;
+
+    await wpPage.evaluate((headCode) => {
+      const editors = document.querySelectorAll('.CodeMirror');
+      if (editors[0] && editors[0].CodeMirror) {
+        editors[0].CodeMirror.setValue(headCode);
+      }
+    }, newHeadContent);
+
+    console.log('✅ Meta tag injected into head');
+
+    const saveBtn = wpPage.locator('button:has-text("Save Changes"), input[type="submit"]').first();
+    await saveBtn.click();
+    console.log('✅ WPCode settings saved');
+    await wpPage.waitForTimeout(2000);
+  }
+
+  await wpPage.close();
+
+  // ── STEP 6: Go back to Search Console and verify ───────────────────────
+  console.log('🔍 Clicking Verify in Search Console...');
+  await page.bringToFront();
+  await page.waitForTimeout(3000);
+
+  const verifyBtn = page.locator('button:has-text("VERIFY"), button:has-text("Verify")').first();
+  await verifyBtn.waitFor({ timeout: 15000 });
+  await verifyBtn.click();
+  await page.waitForTimeout(6000);
+
+  const verified = await page.evaluate(() => {
+    const body = document.body.innerText;
+    return body.includes('Ownership verified') || body.includes('verified');
+  });
+
+  await browser.close();
+
+  if (verified) {
+    return res.json({
+      status: 'success',
+      message: 'Search Console property added and verified',
+      website_url,
+      verified: true
+    });
+  } else {
+    const pageSnippet = await page.evaluate(() => document.body.innerText.substring(0, 300)).catch(() => '');
+    return res.json({
+      status: 'partial',
+      message: 'Meta tag injected but verification result unclear — check Search Console manually',
+      website_url,
+      verified: false,
+      page_state: pageSnippet
+    });
+  }
+}
+
+
+
+
+if (action === 'fetch_gtm_codes') {
+  console.log('🔍 Fetching GTM codes for container:', req.body.gtm_container_id);
+
+  const { gtm_container_id } = req.body;
+  if (!gtm_container_id) throw new Error('Missing gtm_container_id');
+
+  // Navigate to GTM
+  await page.goto('https://tagmanager.google.com', { waitUntil: 'load', timeout: 60000 });
+  await page.waitForTimeout(3000);
+
+  // Find and click the container, then select most active workspace
+  console.log('🔍 Looking for container:', gtm_container_id);
+  await openContainerFromHomeList(page, gtm_container_id);
+
+  // Extract numeric account and container IDs from URL
+  const gtmUrl = page.url();
+  console.log('📍 GTM URL after workspace entry:', gtmUrl);
+  let numericAccountId = null;
+  let numericContainerId = null;
+  const gtmUrlMatch = gtmUrl.match(/accounts\/(\d+)\/containers\/(\d+)/);
+  if (gtmUrlMatch) {
+    numericAccountId = gtmUrlMatch[1];
+    numericContainerId = gtmUrlMatch[2];
+    console.log('✅ Numeric Account ID:', numericAccountId);
+    console.log('✅ Numeric Container ID:', numericContainerId);
+  } else {
+    console.log('⚠️ Could not extract numeric IDs from URL:', gtmUrl);
+  }
+
+  // Now we're in the workspace — go to Admin tab
+  console.log('⚙️ Clicking Admin tab...');
+  const adminTab = page.locator('a:has-text("Admin"), [role="link"]:has-text("Admin")').first();
+  await adminTab.waitFor({ state: 'visible', timeout: 30000 });
+  await adminTab.click();
+  await page.waitForTimeout(2000);
+
+  // Click Install Google Tag Manager
+  console.log('🔍 Clicking Install Google Tag Manager...');
+  const installLink = page.locator(
+    'a:has-text("Install Google Tag Manager"), ' +
+    '[role="link"]:has-text("Install Google Tag Manager")'
+  ).first();
+  await installLink.waitFor({ state: 'visible', timeout: 30000 });
+  await installLink.click();
+  await page.waitForTimeout(2000);
+
+  // Extract codes
+  console.log('📋 Extracting GTM codes...');
+  const { containerId, gtmHeadCode, gtmBodyCode } = await extractGTMCodes(page);
+
+  await browser.close();
+  return res.json({
+    status: 'success',
+    gtm_container_id: containerId,
+    gtm_head_code: gtmHeadCode,
+    gtm_body_code: gtmBodyCode,
+    numeric_account_id: numericAccountId,
+    numeric_container_id: numericContainerId
+  });
+}
+
+if (action === 'fetch_gtm_codes') {
+  console.log('🔍 Fetching GTM codes for container:', req.body.gtm_container_id);
+
+  const { gtm_container_id } = req.body;
+  if (!gtm_container_id) throw new Error('Missing gtm_container_id');
+
+  // Navigate to GTM
+  await page.goto('https://tagmanager.google.com', { waitUntil: 'load', timeout: 60000 });
+  await page.waitForTimeout(3000);
+
+  // Find and click the container, then select most active workspace
+  console.log('🔍 Looking for container:', gtm_container_id);
+  await openContainerFromHomeList(page, gtm_container_id);
+
+  // Extract numeric account and container IDs from URL
+  const gtmUrl = page.url();
+  console.log('📍 GTM URL after workspace entry:', gtmUrl);
+  let numericAccountId = null;
+  let numericContainerId = null;
+  const gtmUrlMatch = gtmUrl.match(/accounts\/(\d+)\/containers\/(\d+)/);
+  if (gtmUrlMatch) {
+    numericAccountId = gtmUrlMatch[1];
+    numericContainerId = gtmUrlMatch[2];
+    console.log('✅ Numeric Account ID:', numericAccountId);
+    console.log('✅ Numeric Container ID:', numericContainerId);
+  } else {
+    console.log('⚠️ Could not extract numeric IDs from URL:', gtmUrl);
+  }
+
+  // Now we're in the workspace — go to Admin tab
+  console.log('⚙️ Clicking Admin tab...');
+  const adminTab = page.locator('a:has-text("Admin"), [role="link"]:has-text("Admin")').first();
+  await adminTab.waitFor({ state: 'visible', timeout: 30000 });
+  await adminTab.click();
+  await page.waitForTimeout(2000);
+
+  // Click Install Google Tag Manager
+  console.log('🔍 Clicking Install Google Tag Manager...');
+  const installLink = page.locator(
+    'a:has-text("Install Google Tag Manager"), ' +
+    '[role="link"]:has-text("Install Google Tag Manager")'
+  ).first();
+  await installLink.waitFor({ state: 'visible', timeout: 30000 });
+  await installLink.click();
+  await page.waitForTimeout(2000);
+
+  // Extract codes
+  console.log('📋 Extracting GTM codes...');
+  const { containerId, gtmHeadCode, gtmBodyCode } = await extractGTMCodes(page);
+
+  await browser.close();
+  return res.json({
+    status: 'success',
+    gtm_container_id: containerId,
+    gtm_head_code: gtmHeadCode,
+    gtm_body_code: gtmBodyCode,
+    numeric_account_id: numericAccountId,
+    numeric_container_id: numericContainerId
+  });
+}
+
+
+async function openContainerFromHomeList(page, gtmContainerId) {
+  console.log('⏳ Waiting for container list to load...');
+  await page.waitForTimeout(3000);
+
+  console.log('🔍 Searching for container:', gtmContainerId);
+
+  const scrollable = await page.$('.gtm-container-list, [class*="container-list"], .accounts-list, md-list, .md-list, main, .content-area');
+
+  let found = false;
+  for (let i = 0; i < 30; i++) {
+    const match = page.getByText(gtmContainerId, { exact: true }).first();
+    const visible = await match.isVisible().catch(() => false);
+
+    if (visible) {
+      console.log('✅ Found container:', gtmContainerId);
+      const row = page.locator(`tr:has-text("${gtmContainerId}"), [role="row"]:has-text("${gtmContainerId}")`).first();
+      const link = row.locator('a, td').first();
+      await link.click();
+      found = true;
+      break;
+    }
+
+    if (scrollable) {
+      await scrollable.evaluate(el => el.scrollBy(0, 300));
+    } else {
+      await page.evaluate(() => window.scrollBy(0, 300));
+    }
+    await page.waitForTimeout(400);
+  }
+
+  if (!found) throw new Error(`Container ${gtmContainerId} not found`);
+
+  // Wait for URL to change to workspaces page
+  console.log('⏳ Waiting for workspaces page...');
+  await page.waitForURL('**/workspaces/**', { timeout: 15000 });
+  await page.waitForTimeout(1000);
+
+  // Check if workspace modal appeared
+  const hasModal = await page.locator('.column-name:has-text("AP Tracking Setup")').isVisible().catch(() => false);
+
+  if (hasModal) {
+    console.log('📋 Workspace modal detected, clicking AP Tracking Setup...');
+    await page.locator('.column-name:has-text("AP Tracking Setup")').first().click();
+    await page.waitForTimeout(2000);
+  } else {
+    console.log('✅ Already in workspace, no modal needed');
+  }
+
+  await page.waitForSelector('a:has-text("Tags")', { timeout: 30000 });
+  console.log('✅ Inside workspace for:', gtmContainerId);
+}
+
+
+
+
+
+
+
+
+if (action === 'test_tracking_ctas') {
+  const { website_url } = req.body;
+  if (!website_url) throw new Error('Missing website_url');
+
+  const targetUrl = website_url.startsWith('http') ? website_url : `https://${website_url}`;
+  const results = { phones: [], emails: [], forms: [] };
+
+  const TEST_VALUES = {
+    fullName: 'HealthCheck Test', email: 'test-automation@example.com',
+    phone: '01632960123', message: 'This is a tracking health check. Please ignore.'
+  };
+
+  const GENERIC_EVENTS = ['page_view', 'user_engagement', 'scroll', 'session_start', 'first_visit'];
+  const beacons = [];
+
+  // Intercept GA4 beacons
+  await page.on('request', req => {
+    const u = req.url();
+    if (u.includes('/g/collect') || u.includes('google-analytics') || u.includes('googletagmanager')) {
+      let en = null;
+      try { en = new URL(u).searchParams.get('en'); } catch {}
+      if (!en) { try { en = new URLSearchParams(req.postData() || '').get('en'); } catch {} }
+      beacons.push({ url: u, event_name: en });
+    }
+  });
+
+  // Mock form POST submissions so we don't spam clients
+  await page.route('**/*', (route) => {
+    const r = route.request();
+    if (r.method() === 'POST' && !r.url().includes('google')) {
+      return route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ success: true }) });
+    }
+    route.continue();
+  });
+
+  await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
+  await page.waitForTimeout(2000);
+
+  // Check all pages
+  const pagesToCheck = [
+    targetUrl,
+    targetUrl.replace(/\/$/, '') + '/contact',
+    targetUrl.replace(/\/$/, '') + '/contact-us',
+  ];
+
+  for (const pageUrl of pagesToCheck) {
+    console.log(`🔎 Checking: ${pageUrl}`);
+    try {
+      await page.goto(pageUrl, { waitUntil: 'domcontentloaded', timeout: 15000 });
+      await page.waitForTimeout(2000);
+
+      // ── Phone CTAs ──
+      const phones = await page.$$eval('a[href^="tel:" i]', els => els.map(a => a.getAttribute('href')));
+      for (const tel of phones) {
+        if (results.phones.find(p => p.href === tel)) continue;
+        console.log(`📞 Testing phone: ${tel}`);
+        const before = beacons.length;
+        const el = page.locator(`a[href="${tel}" i]`).first();
+        await el.click({ noWaitAfter: true }).catch(() => {});
+        await page.waitForTimeout(3000);
+        const fired = beacons.slice(before).filter(b => !GENERIC_EVENTS.includes(b.event_name));
+        results.phones.push({
+          href: tel,
+          status: fired.length ? 'PASS' : 'FAIL',
+          events: fired.map(b => b.event_name)
+        });
+      }
+
+      // ── Email CTAs ──
+      const emails = await page.$$eval('a[href^="mailto:" i]', els => els.map(a => a.getAttribute('href')));
+      for (const mail of emails) {
+        if (results.emails.find(e => e.href === mail)) continue;
+        console.log(`📧 Testing email: ${mail}`);
+        const before = beacons.length;
+        const el = page.locator(`a[href="${mail}" i]`).first();
+        await el.click({ noWaitAfter: true }).catch(() => {});
+        await page.waitForTimeout(3000);
+        const fired = beacons.slice(before).filter(b => !GENERIC_EVENTS.includes(b.event_name));
+        results.emails.push({
+          href: mail,
+          status: fired.length ? 'PASS' : 'FAIL',
+          events: fired.map(b => b.event_name)
+        });
+      }
+
+      // ── Forms ──
+      const formCount = await page.$$eval('form', forms => forms.length);
+      for (let i = 0; i < formCount; i++) {
+        const form = page.locator('form').nth(i);
+
+        // Score form to check it's a lead form
+        const isLeadForm = await form.evaluate(f => {
+          const hay = (f.id + ' ' + f.className + ' ' + f.innerText).toLowerCase();
+          if (/search|login|subscribe/.test(hay) && f.querySelectorAll('input').length < 3) return false;
+          return !!f.querySelector('input[type="email"], textarea, input[name*="email" i]');
+        }).catch(() => false);
+
+        if (!isLeadForm) continue;
+
+        console.log(`📝 Testing form ${i} on ${pageUrl}`);
+        const before = beacons.length;
+
+        // Fill fields
+        const fields = form.locator('input:visible, textarea:visible, select:visible');
+        const fieldCount = await fields.count();
+        for (let j = 0; j < fieldCount; j++) {
+          const field = fields.nth(j);
+          const type = await field.getAttribute('type').catch(() => '');
+          const name = (await field.getAttribute('name').catch(() => '')) || '';
+          const tag = await field.evaluate(el => el.tagName.toLowerCase()).catch(() => '');
+
+          if (type === 'hidden') continue;
+          if (tag === 'select') {
+            await field.evaluate(sel => { if (sel.options.length > 1) { sel.selectedIndex = 1; sel.dispatchEvent(new Event('change', { bubbles: true })); } }).catch(() => {});
+          } else if (type === 'checkbox' || type === 'radio') {
+            await field.check({ force: true }).catch(() => {});
+          } else if (/email/.test(type + name)) {
+            await field.fill(TEST_VALUES.email).catch(() => {});
+          } else if (/phone|tel/.test(type + name)) {
+            await field.fill(TEST_VALUES.phone).catch(() => {});
+          } else if (tag === 'textarea') {
+            await field.fill(TEST_VALUES.message).catch(() => {});
+          } else {
+            await field.fill(TEST_VALUES.fullName).catch(() => {});
+          }
+        }
+
+        // Submit
+        const btn = form.locator('button[type="submit"], input[type="submit"], button').first();
+        await btn.click({ noWaitAfter: true }).catch(() => form.evaluate(f => f.submit()).catch(() => {}));
+        await page.waitForTimeout(4000);
+
+        const fired = beacons.slice(before).filter(b => !GENERIC_EVENTS.includes(b.event_name));
+        const successText = await page.evaluate(() => /thank|success|sent|confirm/i.test(document.body.innerText)).catch(() => false);
+
+        results.forms.push({
+          page: pageUrl,
+          form_index: i,
+          status: fired.length ? 'PASS' : 'FAIL',
+          events: fired.map(b => b.event_name),
+          form_submitted: successText
+        });
+
+        if (fired.length) break; // Found a working form, move on
+      }
+    } catch (err) {
+      console.log(`⚠️ Could not check ${pageUrl}: ${err.message}`);
+    }
+  }
+
+  console.log('📋 CTA Test Results:', JSON.stringify(results, null, 2));
+
+  await browser.close();
+  return res.json({
+    status: 'success',
+    website_url: targetUrl,
+    phones: results.phones,
+    emails: results.emails,
+    forms: results.forms,
+    summary: {
+      phones_found: results.phones.length,
+      phones_passed: results.phones.filter(p => p.status === 'PASS').length,
+      emails_found: results.emails.length,
+      emails_passed: results.emails.filter(e => e.status === 'PASS').length,
+      forms_found: results.forms.length,
+      forms_passed: results.forms.filter(f => f.status === 'PASS').length,
+    }
+  });
+}
+
 
 
 
@@ -2928,167 +4177,6 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`🚀 Runner listening on port ${PORT}`);
 });
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 
 
