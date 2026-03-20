@@ -35,7 +35,7 @@ async function clickWebPlatform(page) {
   // If we're already on the web stream form, skip the platform picker
   const websiteInput = page.getByPlaceholder('www.mywebsite.com');
   if (await websiteInput.count() > 0) {
-    console.log(' Already on web stream form, skipping platform selection');
+    console.log('✅ Already on web stream form, skipping platform selection');
     return;
   }
   
@@ -57,7 +57,7 @@ async function clickWebPlatform(page) {
     const btn = page.locator(selector).filter({ hasText: /^Web$/i });
     if (await btn.count() > 0) {
       webBtn = btn.first();
-      console.log(`Found Web button with selector: ${selector}`);
+      console.log(`✅ Found Web button with selector: ${selector}`);
       break;
     }
   }
@@ -75,7 +75,7 @@ async function clickWebPlatform(page) {
     // Double-check if we're already on the form
     await page.waitForTimeout(1000);
     if (await websiteInput.count() > 0) {
-      console.log(' Confirmed: already on web stream form');
+      console.log('✅ Confirmed: already on web stream form');
       return;
     }
     
@@ -86,7 +86,7 @@ async function clickWebPlatform(page) {
   await webBtn.click({ timeout: 15000 });
   await page.waitForTimeout(1000);
   
-  console.log(' Clicked Web platform button');
+  console.log('✅ Clicked Web platform button');
 }
 
 
@@ -1596,6 +1596,105 @@ if (await exactMatch.isVisible({ timeout: 5000 }).catch(() => false)) {
 }
 
 
+
+async function discoverSitePages(page, baseUrl) {
+  try {
+    await page.goto(baseUrl, { waitUntil: 'networkidle', timeout: 20000 });
+    await page.waitForTimeout(3000);
+
+    const links = await page.evaluate((base) => {
+      const anchors = Array.from(document.querySelectorAll('a[href]'));
+      const urls = anchors
+        .map(a => a.href)
+        .filter(href => {
+          try {
+            const u = new URL(href);
+            const b = new URL(base);
+            return u.hostname === b.hostname &&
+              !href.includes('#') &&
+              !href.match(/\.(pdf|jpg|png|gif|zip|doc|css|js)$/i);
+          } catch { return false; }
+        });
+      return [...new Set(urls)].slice(0, 30);
+    }, baseUrl);
+
+    if (links.length === 0) {
+      console.log('⚠️ No links found, using default pages');
+      return [baseUrl, baseUrl + '/contact', baseUrl + '/contact-us', baseUrl + '/get-in-touch'];
+    }
+
+    // always include homepage
+    if (!links.includes(baseUrl)) links.unshift(baseUrl);
+
+    console.log(`✅ Discovered ${links.length} pages from navigation`);
+    return links;
+  } catch (err) {
+    console.log('⚠️ Could not crawl site pages, using defaults');
+    return [baseUrl, baseUrl + '/contact', baseUrl + '/contact-us', baseUrl + '/get-in-touch'];
+  }
+}
+
+
+
+
+async function detectSuccessSelector(page) {
+  return await page.evaluate(() => {
+    const knownSelectors = [
+      { selector: '.wpcf7-mail-sent-ok',        plugin: 'cf7' },
+      { selector: '.wpforms-confirmation',       plugin: 'wpforms' },
+      { selector: '.gform_confirmation_message', plugin: 'gravity' },
+      { selector: '.elementor-message-success',  plugin: 'elementor' },
+      { selector: '.et_pb_contact_form_success', plugin: 'divi' },
+      { selector: '.frm_message',                plugin: 'formidable' },
+      { selector: '.nf-response-msg',            plugin: 'ninjaforms' },
+      { selector: '.ff-message-success',         plugin: 'fluentforms' },
+    ];
+
+    for (const { selector, plugin } of knownSelectors) {
+      if (document.querySelector(selector)) return { selector, plugin, method: 'known' };
+    }
+
+    const candidates = document.querySelectorAll('*');
+
+    for (const el of candidates) {
+      // FIX: safely convert className to string (SVG elements have it as an object)
+      const cls = (typeof el.className === 'string' ? el.className : '').toLowerCase();
+      const id = (el.id || '').toLowerCase();
+      const tag = el.tagName.toLowerCase();
+
+      if (tag === 'html' || tag === 'body' || tag === 'script' || tag === 'style' || tag === 'svg') continue;
+
+      const looksLikeSuccess =
+        /thank|success|sent|confirm|complete|submission/.test(cls) ||
+        /thank|success|sent|confirm|complete|submission/.test(id);
+
+      if (!looksLikeSuccess) continue;
+
+      const style = window.getComputedStyle(el);
+      const isHidden =
+        style.display === 'none' ||
+        style.visibility === 'hidden' ||
+        style.opacity === '0' ||
+        el.hidden;
+
+      if (isHidden) {
+        const builtSelector = el.id
+          ? `#${el.id}`
+          : cls
+          ? `.${cls.trim().split(/\s+/)[0]}`
+          : el.tagName.toLowerCase();
+
+        return { selector: builtSelector, plugin: 'generic', method: 'hidden_element' };
+      }
+    }
+
+    return null;
+  });
+}
+
+
+
+
 const sessions = {};
 
 
@@ -2987,41 +3086,19 @@ if (cms === 'wordpress') {
       return [...new Set(urls.filter(Boolean))];
     }
 
-    const pagesToCheck = dedupeUrls([
-      siteBaseUrl,
-      siteBaseUrl + '/contact',
-      siteBaseUrl + '/contact-us',
-      siteBaseUrl + '/contact-me',
-      siteBaseUrl + '/contactus',
-      siteBaseUrl + '/get-in-touch',
-      siteBaseUrl + '/getintouch',
-      siteBaseUrl + '/enquiry',
-      siteBaseUrl + '/enquiries',
-      siteBaseUrl + '/enquire',
-      siteBaseUrl + '/make-an-enquiry',
-      siteBaseUrl + '/quote',
-      siteBaseUrl + '/free-quote',
-      siteBaseUrl + '/get-a-quote',
-      siteBaseUrl + '/request-a-quote',
-      siteBaseUrl + '/request-quote',
-      siteBaseUrl + '/book',
-      siteBaseUrl + '/book-now',
-      siteBaseUrl + '/booking',
-      siteBaseUrl + '/bookings',
-      siteBaseUrl + '/support',
-      siteBaseUrl + '/help',
-      siteBaseUrl + '/reach-us',
-      siteBaseUrl + '/reach-out',
-      siteBaseUrl + '/talk-to-us',
-      siteBaseUrl + '/speak-to-us',
-      siteBaseUrl + '/hire-us',
-      siteBaseUrl + '/work-with-us',
-      siteBaseUrl + '/sales',
-      siteBaseUrl + '/demo',
-      siteBaseUrl + '/request-demo',
-      siteBaseUrl + '/free-consultation',
-      siteBaseUrl + '/consultation',
-    ]);
+    
+const pagesToCheck = await discoverSitePages(page, siteBaseUrl);
+
+
+const pluginFallbacks = {
+  cf7:       '.wpcf7-mail-sent-ok',
+  wpforms:   '.wpforms-confirmation',
+  gravity:   '.gform_confirmation_message',
+  elementor: '.elementor-message-success',
+  divi:      '.et_pb_contact_form_success',
+  generic:   "[class*='thank'], [class*='success'], [class*='confirmation']"
+};
+
 
     console.log('📄 Pages to check:', pagesToCheck.join(', '));
 
@@ -3031,6 +3108,9 @@ if (cms === 'wordpress') {
     let detected_form_selector = null;
     let detected_form_action = null;
     let detected_form_source_url = null;
+    let detected_success_selector = null;  
+    let detected_success_method = null;
+    let detected_success_selectors = [];
 
     async function detectBestFormOnPage(pageOrFrame) {
       return await pageOrFrame.evaluate(() => {
@@ -3141,16 +3221,30 @@ if (cms === 'wordpress') {
 
       let formMeta = await detectBestFormOnPage(page);
 
-      if (formMeta) {
-        detected_form_type = formMeta.type;
-        detected_form_id = formMeta.form_id;
-        detected_form_class = formMeta.form_class;
-        detected_form_selector = formMeta.selector;
-        detected_form_action = formMeta.form_action;
-        detected_form_source_url = pageUrl;
-        console.log(`✅ Form detected on ${pageUrl}: ${formMeta.type} | selector: ${formMeta.selector} | id: ${formMeta.form_id}`);
-        break;
-      }
+      
+    if (formMeta) {
+  if (detected_form_type === 'unknown') {
+    detected_form_type = formMeta.type;
+    detected_form_id = formMeta.form_id;
+    detected_form_class = formMeta.form_class;
+    detected_form_selector = formMeta.selector;
+    detected_form_action = formMeta.form_action;
+    detected_form_source_url = pageUrl;
+  }
+
+  const successMeta = await detectSuccessSelector(page);
+  const thisSelector = successMeta?.selector || pluginFallbacks[formMeta.type] || null;
+
+  if (thisSelector && !detected_success_selectors.includes(thisSelector)) {
+    detected_success_selectors.push(thisSelector);
+  }
+
+  console.log(`✅ Form detected on ${pageUrl}: ${formMeta.type} | selector: ${formMeta.selector}`);
+  console.log(`✅ Success selector: ${thisSelector}`);
+}
+
+
+
 
       for (const frame of page.frames()) {
         try {
@@ -3170,7 +3264,7 @@ if (cms === 'wordpress') {
         }
       }
 
-      if (detected_form_type !== 'unknown') break;
+    
       console.log(`⚠️ No form detected on ${pageUrl}`);
     }
 
@@ -3180,19 +3274,20 @@ if (cms === 'wordpress') {
     console.log('✅ GTM codes installed on WordPress site');
 
     return res.json({
-      success: true,
-      message: 'GTM codes installed successfully',
-      detected_form_type,
-      detected_form_id,
-      detected_form_class,
-      detected_form_selector,
-      detected_form_action,
-      detected_form_source_url
-    });
+  success: true,
+  message: 'GTM codes installed successfully',
+  detected_form_type,
+  detected_form_id,
+  detected_form_class,
+  detected_form_selector,
+  detected_form_action,
+  detected_form_source_url,
+  detected_success_selector,
+  detected_success_selectors,
+  detected_success_method
+});
   }
 }
-
-
 
 
 
