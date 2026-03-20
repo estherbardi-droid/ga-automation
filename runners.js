@@ -1599,7 +1599,7 @@ if (await exactMatch.isVisible({ timeout: 5000 }).catch(() => false)) {
 
 async function discoverSitePages(page, baseUrl) {
   try {
-    await page.goto(baseUrl, { waitUntil: 'networkidle', timeout: 20000 });
+    await page.goto(baseUrl, { waitUntil: 'domcontentloaded', timeout: 20000 });
     await page.waitForTimeout(3000);
 
     const links = await page.evaluate((base) => {
@@ -3223,26 +3223,24 @@ const pluginFallbacks = {
 
       
     if (formMeta) {
-  if (detected_form_type === 'unknown') {
-    detected_form_type = formMeta.type;
-    detected_form_id = formMeta.form_id;
-    detected_form_class = formMeta.form_class;
-    detected_form_selector = formMeta.selector;
-    detected_form_action = formMeta.form_action;
-    detected_form_source_url = pageUrl;
-  }
+  detected_form_type = formMeta.type;
+  detected_form_id = formMeta.form_id;
+  detected_form_class = formMeta.form_class;
+  detected_form_selector = formMeta.selector;
+  detected_form_action = formMeta.form_action;
+  detected_form_source_url = pageUrl;
 
   const successMeta = await detectSuccessSelector(page);
   const thisSelector = successMeta?.selector || pluginFallbacks[formMeta.type] || null;
 
-  if (thisSelector && !detected_success_selectors.includes(thisSelector)) {
-    detected_success_selectors.push(thisSelector);
-  }
+  if (thisSelector) detected_success_selectors.push(thisSelector);
 
   console.log(`✅ Form detected on ${pageUrl}: ${formMeta.type} | selector: ${formMeta.selector}`);
   console.log(`✅ Success selector: ${thisSelector}`);
-}
 
+  // Found what we need — stop checking pages
+  break;
+}
 
 
 
