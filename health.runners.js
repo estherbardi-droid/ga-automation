@@ -1493,5 +1493,160 @@ async function trackingHealthCheckSite(url) {
   }
 }
 
-module.exports = { trackingHealthCheckSite };
+// ─────────────────────────────────────────────
+// Batch processing system
+// ─────────────────────────────────────────────
 
+// In-memory job store for batch processing
+const batchJobs = new Map(); // job_id -> { total, completed, results, status, startedAt, callbackUrl }
+
+/**
+ * Process multiple clients in a batch, using the existing concurrency controls.
+ * Each client object must have a `url` field; any additional fields (client_name,
+ * supabase_id, cid, order_number, etc.) are passed through to the result unchanged.
+ * Results accumulate as each check completes.
+ *
+ * @param {string} jobId
+ * @param {Array<{url: string, [key: string]: any}>} clients
+ * @param {string|null} callbackUrl
+ */
+async function runBatchHealthCheck(jobId, clients, callbackUrl = null) {
+  // Normalise: accept plain string URLs or client objects
+  const clientList = clients.map((c, i) =>
+    typeof c === 'string' ? { url: c, _index: i } : { ...c, _index: i }
+  );
+
+  // Initialize job in store
+  batchJobs.set(jobId, {
+    total: clientList.length,
+    completed: 0,
+    results: [],
+    status: 'running',
+    startedAt: new Date().toISOString(),
+    callbackUrl
+  });
+
+  logInfo(`🚀 Starting batch job ${jobId} with ${clientList.length} clients`);
+
+  // Process all clients concurrently (each respects the slot queue)
+  const promises = clientList.map(async (client) => {
+    const { url, _index, ...metadata } = client;
+    try {
+      // Uses acquireCheckSlot/releaseCheckSlot internally
+      const result = await trackingHealthCheckSite(url);
+
+      // Store result with original client metadata attached
+      const job = batchJobs.get(jobId);
+      if (job) {
+        job.results.push({ ...metadata, url, index: _index, ...result });
+        job.completed++;
+        logDebug(`✓ Batch job ${jobId}: completed ${job.completed}/${job.total}`);
+      }
+
+      return result;
+    } catch (error) {
+      // Store error result with metadata so the caller can still identify the client
+      const job = batchJobs.get(jobId);
+      if (job) {
+        job.results.push({
+          ...metadata,
+          url,
+          index: _index,
+          ok: false,
+          error: error.message,
+          status: 'error',
+          overall_status: 'ERROR'
+        });
+        job.completed++;
+        logDebug(`✗ Batch job ${jobId}: error for ${url} - ${error.message}`);
+      }
+
+      return { ok: false, url, error: error.message, status: 'error' };
+    }
+  });
+
+  // Wait for all to complete
+  try {
+    await Promise.all(promises);
+
+    // Mark job as complete
+    const job = batchJobs.get(jobId);
+    if (job) {
+      job.status = 'complete';
+      // Sort results by original index to maintain order
+      job.results.sort((a, b) => a.index - b.index);
+      logInfo(`✅ Batch job ${jobId} completed: ${job.completed}/${job.total} processed`);
+
+      // Send callback if provided
+      if (callbackUrl) {
+        sendBatchCallback(jobId, job, callbackUrl);
+      }
+    }
+  } catch (error) {
+    // This shouldn't happen since we handle individual errors above,
+    // but just in case
+    const job = batchJobs.get(jobId);
+    if (job) {
+      job.status = 'error';
+      job.error = error.message;
+      logInfo(`❌ Batch job ${jobId} failed: ${error.message}`);
+    }
+  }
+}
+
+/**
+ * Get batch job status and results
+ */
+function getBatchJob(jobId) {
+  return batchJobs.get(jobId);
+}
+
+/**
+ * Send callback notification when batch job completes
+ */
+async function sendBatchCallback(jobId, job, callbackUrl) {
+  const url = require('url');
+  const parsedUrl = url.parse(callbackUrl);
+  const isHttps = parsedUrl.protocol === 'https:';
+  const httpModule = isHttps ? require('https') : require('http');
+
+  const payload = JSON.stringify({
+    job_id: jobId,
+    status: job.status,
+    total: job.total,
+    completed: job.completed,
+    results: job.results,
+    startedAt: job.startedAt,
+    completedAt: new Date().toISOString()
+  });
+
+  const options = {
+    hostname: parsedUrl.hostname,
+    port: parsedUrl.port || (isHttps ? 443 : 80),
+    path: parsedUrl.path,
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Content-Length': Buffer.byteLength(payload)
+    }
+  };
+
+  logInfo(`📞 Sending batch completion callback to ${callbackUrl}`);
+
+  const req = httpModule.request(options, (res) => {
+    logDebug(`Callback response status: ${res.statusCode}`);
+  });
+
+  req.on('error', (error) => {
+    logInfo(`❌ Callback failed: ${error.message}`, { jobId, callbackUrl });
+  });
+
+  req.write(payload);
+  req.end();
+}
+
+module.exports = {
+  trackingHealthCheckSite,
+  runBatchHealthCheck,
+  getBatchJob
+};
