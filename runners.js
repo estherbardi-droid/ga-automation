@@ -1723,7 +1723,7 @@ if (!['login_and_create_ga4', 'create_ga_account', 'fetch_gtag_and_property_id',
   let browser;
 
   try {
-    browser = await chromium.launch({ headless: false });
+    browser = await chromium.launch({ headless: true });
     const context = await browser.newContext({ viewport: { width: 1280, height: 800 } });
     let page = await context.newPage(); // NOTE: changed from const -> let so Step 2 recovery can replace the tab
 
